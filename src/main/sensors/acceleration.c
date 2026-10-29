@@ -123,6 +123,7 @@ void accUpdate(timeUs_t currentTimeUs)
     UNUSED(currentTimeUs);
 
     if (!acc.dev.readFn(&acc.dev)) {
+        acc.isAccelDataValid = false;
         return;
     }
 
@@ -154,6 +155,7 @@ void accUpdate(timeUs_t currentTimeUs)
 #endif
 
     acc.isAccelUpdatedAtLeastOnce = true;
+    acc.isAccelDataValid = true;
 }
 
 #ifdef USE_CRSF_ACCGYRO_TELEMETRY

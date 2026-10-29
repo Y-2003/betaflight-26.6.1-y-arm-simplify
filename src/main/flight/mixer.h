@@ -142,6 +142,9 @@ bool mixerIsTricopter(void);
 
 void mixerSetThrottleAngleCorrection(int correctionValue);
 float mixerGetThrottle(void);
+// Final collective after mode overrides and mixer desaturation, PWM-equivalent
+// 1000..2000. Individual motor commands remain in motor[].
+bool mixerGetFinalThrottle(uint16_t *pwm, timeUs_t *sampleTimeUs);
 float mixerGetRcThrottle(void);
 mixerMode_e getMixerMode(void);
 bool mixerModeIsFixedWing(mixerMode_e mixerMode);

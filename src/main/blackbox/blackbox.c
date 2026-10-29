@@ -70,6 +70,10 @@
 #include "flight/rpm_filter.h"
 #include "flight/servos.h"
 #include "flight/imu.h"
+#include "flight/autonomous_mode.h"
+#include "flight/alt_hold.h"
+#include "flight/autopilot.h"
+#include "flight/position_estimator.h"
 
 #include "io/beeper.h"
 #include "io/gps.h"
@@ -257,6 +261,22 @@ static const blackboxDeltaFieldDefinition_t blackboxMainFields[] = {
     {"imuQuaternion",    1, SIGNED,   .Ipredict = PREDICT(0),  .Iencode = ENCODING(SIGNED_VB),   .Ppredict = PREDICT(AVERAGE_2),     .Pencode = ENCODING(SIGNED_VB), CONDITION(ATTITUDE)},
     {"imuQuaternion",    2, SIGNED,   .Ipredict = PREDICT(0),  .Iencode = ENCODING(SIGNED_VB),   .Ppredict = PREDICT(AVERAGE_2),     .Pencode = ENCODING(SIGNED_VB), CONDITION(ATTITUDE)},
 #endif
+    {"attitude",         0, SIGNED,   .Ipredict = PREDICT(0),  .Iencode = ENCODING(SIGNED_VB),   .Ppredict = PREDICT(AVERAGE_2),     .Pencode = ENCODING(SIGNED_VB), CONDITION(ATTITUDE)},
+    {"attitude",         1, SIGNED,   .Ipredict = PREDICT(0),  .Iencode = ENCODING(SIGNED_VB),   .Ppredict = PREDICT(AVERAGE_2),     .Pencode = ENCODING(SIGNED_VB), CONDITION(ATTITUDE)},
+    {"attitude",         2, SIGNED,   .Ipredict = PREDICT(0),  .Iencode = ENCODING(SIGNED_VB),   .Ppredict = PREDICT(AVERAGE_2),     .Pencode = ENCODING(SIGNED_VB), CONDITION(ATTITUDE)},
+    {"autonomousState",  -1, SIGNED,  .Ipredict = PREDICT(0),  .Iencode = ENCODING(SIGNED_VB),   .Ppredict = PREDICT(PREVIOUS), .Pencode = ENCODING(SIGNED_VB), CONDITION(AUTONOMOUS)},
+    {"autonomousValidity", -1, SIGNED, .Ipredict = PREDICT(0), .Iencode = ENCODING(SIGNED_VB),   .Ppredict = PREDICT(PREVIOUS), .Pencode = ENCODING(SIGNED_VB), CONDITION(AUTONOMOUS)},
+    {"autonomousArmResult", -1, SIGNED, .Ipredict = PREDICT(0), .Iencode = ENCODING(SIGNED_VB), .Ppredict = PREDICT(PREVIOUS), .Pencode = ENCODING(SIGNED_VB), CONDITION(AUTONOMOUS)},
+    {"autonomousArmBlockingFlags", -1, SIGNED, .Ipredict = PREDICT(0), .Iencode = ENCODING(SIGNED_VB), .Ppredict = PREDICT(PREVIOUS), .Pencode = ENCODING(SIGNED_VB), CONDITION(AUTONOMOUS)},
+    {"autonomousThrottlePwm", -1, SIGNED, .Ipredict = PREDICT(0), .Iencode = ENCODING(SIGNED_VB), .Ppredict = PREDICT(PREVIOUS), .Pencode = ENCODING(SIGNED_VB), CONDITION(AUTONOMOUS)},
+    {"autonomousTargetAltitude", -1, SIGNED, .Ipredict = PREDICT(0), .Iencode = ENCODING(SIGNED_VB), .Ppredict = PREDICT(PREVIOUS), .Pencode = ENCODING(SIGNED_VB), CONDITION(AUTONOMOUS)},
+    {"autonomousTargetVerticalVelocity", -1, SIGNED, .Ipredict = PREDICT(0), .Iencode = ENCODING(SIGNED_VB), .Ppredict = PREDICT(PREVIOUS), .Pencode = ENCODING(SIGNED_VB), CONDITION(AUTONOMOUS)},
+    {"autonomousVerticalVelocity", -1, SIGNED, .Ipredict = PREDICT(0), .Iencode = ENCODING(SIGNED_VB), .Ppredict = PREDICT(PREVIOUS), .Pencode = ENCODING(SIGNED_VB), CONDITION(AUTONOMOUS)},
+    {"autonomousHorizontalDistance", -1, SIGNED, .Ipredict = PREDICT(0), .Iencode = ENCODING(SIGNED_VB), .Ppredict = PREDICT(PREVIOUS), .Pencode = ENCODING(SIGNED_VB), CONDITION(AUTONOMOUS)},
+    {"autonomousTargetHorizontalVelocity", -1, SIGNED, .Ipredict = PREDICT(0), .Iencode = ENCODING(SIGNED_VB), .Ppredict = PREDICT(PREVIOUS), .Pencode = ENCODING(SIGNED_VB), CONDITION(AUTONOMOUS)},
+    {"autonomousHorizontalVelocity", -1, SIGNED, .Ipredict = PREDICT(0), .Iencode = ENCODING(SIGNED_VB), .Ppredict = PREDICT(PREVIOUS), .Pencode = ENCODING(SIGNED_VB), CONDITION(AUTONOMOUS)},
+    {"autonomousAltitude", -1, SIGNED, .Ipredict = PREDICT(0), .Iencode = ENCODING(SIGNED_VB), .Ppredict = PREDICT(PREVIOUS), .Pencode = ENCODING(SIGNED_VB), CONDITION(AUTONOMOUS)},
+    {"autonomousControlStatus", -1, SIGNED, .Ipredict = PREDICT(0), .Iencode = ENCODING(SIGNED_VB), .Ppredict = PREDICT(PREVIOUS), .Pencode = ENCODING(SIGNED_VB), CONDITION(AUTONOMOUS)},
     {"debug",       0, SIGNED,   .Ipredict = PREDICT(0),       .Iencode = ENCODING(SIGNED_VB),   .Ppredict = PREDICT(AVERAGE_2),     .Pencode = ENCODING(SIGNED_VB), CONDITION(DEBUG_LOG)},
     {"debug",       1, SIGNED,   .Ipredict = PREDICT(0),       .Iencode = ENCODING(SIGNED_VB),   .Ppredict = PREDICT(AVERAGE_2),     .Pencode = ENCODING(SIGNED_VB), CONDITION(DEBUG_LOG)},
     {"debug",       2, SIGNED,   .Ipredict = PREDICT(0),       .Iencode = ENCODING(SIGNED_VB),   .Ppredict = PREDICT(AVERAGE_2),     .Pencode = ENCODING(SIGNED_VB), CONDITION(DEBUG_LOG)},
@@ -368,6 +388,20 @@ typedef struct blackboxMainState_s {
     int16_t setpoint[4];
     int16_t gyroADC[XYZ_AXIS_COUNT];
     int16_t gyroUnfilt[XYZ_AXIS_COUNT];
+    int16_t attitude[XYZ_AXIS_COUNT]; // Roll, pitch, yaw in 0.1 degree
+    int16_t autonomousState;
+    int16_t autonomousValidity;
+    int16_t autonomousArmResult;
+    int32_t autonomousArmBlockingFlags;
+    int16_t autonomousThrottlePwm;
+    int32_t autonomousTargetAltitudeCm;
+    int32_t autonomousTargetVerticalVelocityCmS;
+    int32_t autonomousVerticalVelocityCmS;
+    int32_t autonomousHorizontalDistanceCm;
+    int32_t autonomousTargetHorizontalVelocityCmS;
+    int32_t autonomousHorizontalVelocityCmS;
+    int32_t autonomousAltitudeCm;
+    int32_t autonomousControlStatus;
 #ifdef USE_ACC
     int16_t accADC[XYZ_AXIS_COUNT];
     int16_t imuAttitudeQuaternion3[XYZ_AXIS_COUNT]; // only x,y,z is stored; w is always positive
@@ -583,6 +617,9 @@ static bool testBlackboxConditionUncached(flightLogFieldCondition_e condition)
     case CONDITION(ATTITUDE):
         return sensors(SENSOR_ACC) && isFieldEnabled(FIELD_SELECT(ATTITUDE));
 
+    case CONDITION(AUTONOMOUS):
+        return isFieldEnabled(FIELD_SELECT(AUTONOMOUS));
+
     case CONDITION(DEBUG_LOG):
         return (debugMode != DEBUG_NONE) && isFieldEnabled(FIELD_SELECT(DEBUG_LOG));
 
@@ -753,8 +790,25 @@ static void writeIntraframe(void)
 
     if (testBlackboxCondition(CONDITION(ATTITUDE))) {
         blackboxWriteSigned16VBArray(blackboxCurrent->imuAttitudeQuaternion3, XYZ_AXIS_COUNT);
+        blackboxWriteSigned16VBArray(blackboxCurrent->attitude, XYZ_AXIS_COUNT);
     }
 #endif
+
+    if (testBlackboxCondition(CONDITION(AUTONOMOUS))) {
+        blackboxWriteSignedVB(blackboxCurrent->autonomousState);
+        blackboxWriteSignedVB(blackboxCurrent->autonomousValidity);
+        blackboxWriteSignedVB(blackboxCurrent->autonomousArmResult);
+        blackboxWriteSignedVB(blackboxCurrent->autonomousArmBlockingFlags);
+        blackboxWriteSignedVB(blackboxCurrent->autonomousThrottlePwm);
+        blackboxWriteSignedVB(blackboxCurrent->autonomousTargetAltitudeCm);
+        blackboxWriteSignedVB(blackboxCurrent->autonomousTargetVerticalVelocityCmS);
+        blackboxWriteSignedVB(blackboxCurrent->autonomousVerticalVelocityCmS);
+        blackboxWriteSignedVB(blackboxCurrent->autonomousHorizontalDistanceCm);
+        blackboxWriteSignedVB(blackboxCurrent->autonomousTargetHorizontalVelocityCmS);
+        blackboxWriteSignedVB(blackboxCurrent->autonomousHorizontalVelocityCmS);
+        blackboxWriteSignedVB(blackboxCurrent->autonomousAltitudeCm);
+        blackboxWriteSignedVB(blackboxCurrent->autonomousControlStatus);
+    }
 
     if (testBlackboxCondition(CONDITION(DEBUG_LOG))) {
         blackboxWriteSigned16VBArray(blackboxCurrent->debug, DEBUG16_VALUE_COUNT);
@@ -938,8 +992,25 @@ static void writeInterframe(void)
 
     if (testBlackboxCondition(CONDITION(ATTITUDE))) {
         blackboxWriteMainStateArrayUsingAveragePredictor(offsetof(blackboxMainState_t, imuAttitudeQuaternion3), XYZ_AXIS_COUNT);
+        blackboxWriteMainStateArrayUsingAveragePredictor(offsetof(blackboxMainState_t, attitude), XYZ_AXIS_COUNT);
     }
 #endif
+
+    if (testBlackboxCondition(CONDITION(AUTONOMOUS))) {
+        blackboxWriteSignedVB(blackboxCurrent->autonomousState - blackboxLast->autonomousState);
+        blackboxWriteSignedVB(blackboxCurrent->autonomousValidity - blackboxLast->autonomousValidity);
+        blackboxWriteSignedVB(blackboxCurrent->autonomousArmResult - blackboxLast->autonomousArmResult);
+        blackboxWriteSignedVB(blackboxCurrent->autonomousArmBlockingFlags - blackboxLast->autonomousArmBlockingFlags);
+        blackboxWriteSignedVB(blackboxCurrent->autonomousThrottlePwm - blackboxLast->autonomousThrottlePwm);
+        blackboxWriteSignedVB(blackboxCurrent->autonomousTargetAltitudeCm - blackboxLast->autonomousTargetAltitudeCm);
+        blackboxWriteSignedVB(blackboxCurrent->autonomousTargetVerticalVelocityCmS - blackboxLast->autonomousTargetVerticalVelocityCmS);
+        blackboxWriteSignedVB(blackboxCurrent->autonomousVerticalVelocityCmS - blackboxLast->autonomousVerticalVelocityCmS);
+        blackboxWriteSignedVB(blackboxCurrent->autonomousHorizontalDistanceCm - blackboxLast->autonomousHorizontalDistanceCm);
+        blackboxWriteSignedVB(blackboxCurrent->autonomousTargetHorizontalVelocityCmS - blackboxLast->autonomousTargetHorizontalVelocityCmS);
+        blackboxWriteSignedVB(blackboxCurrent->autonomousHorizontalVelocityCmS - blackboxLast->autonomousHorizontalVelocityCmS);
+        blackboxWriteSignedVB(blackboxCurrent->autonomousAltitudeCm - blackboxLast->autonomousAltitudeCm);
+        blackboxWriteSignedVB(blackboxCurrent->autonomousControlStatus - blackboxLast->autonomousControlStatus);
+    }
 
     if (testBlackboxCondition(CONDITION(DEBUG_LOG))) {
         blackboxWriteMainStateArrayUsingAveragePredictor(offsetof(blackboxMainState_t, debug), DEBUG16_VALUE_COUNT);
@@ -1261,6 +1332,7 @@ static void loadMainState(timeUs_t currentTimeUs)
 #endif
         blackboxCurrent->gyroADC[i] = lrintf(gyro.gyroADCf[i] * blackboxHighResolutionScale);
         blackboxCurrent->gyroUnfilt[i] = lrintf(gyro.gyroADC[i] * blackboxHighResolutionScale);
+        blackboxCurrent->attitude[i] = attitude.raw[i];
 
 #if defined(USE_ACC)
         blackboxCurrent->accADC[i] = lrintf(acc.accADC.v[i]);
@@ -1269,6 +1341,67 @@ static void loadMainState(timeUs_t currentTimeUs)
         blackboxCurrent->magADC[i] = lrintf(mag.magADC.v[i]);
 #endif
     }
+
+    blackboxCurrent->autonomousState = 0;
+    blackboxCurrent->autonomousValidity = 0;
+    blackboxCurrent->autonomousArmResult = 0;
+    blackboxCurrent->autonomousArmBlockingFlags = 0;
+    blackboxCurrent->autonomousThrottlePwm = 0;
+    blackboxCurrent->autonomousTargetAltitudeCm = 0;
+    blackboxCurrent->autonomousTargetVerticalVelocityCmS = 0;
+    blackboxCurrent->autonomousVerticalVelocityCmS = 0;
+    blackboxCurrent->autonomousHorizontalDistanceCm = 0;
+    blackboxCurrent->autonomousTargetHorizontalVelocityCmS = 0;
+    blackboxCurrent->autonomousHorizontalVelocityCmS = 0;
+    blackboxCurrent->autonomousAltitudeCm = 0;
+    blackboxCurrent->autonomousControlStatus = 0;
+
+    blackboxCurrent->autonomousState = autonomousModeGetState();
+    const bool autonomousAccValid = sensors(SENSOR_ACC) && acc.isAccelDataValid;
+    blackboxCurrent->autonomousValidity =
+        (positionEstimatorIsValidZ() ? (1 << 0) : 0)
+        | (positionEstimatorIsValidXY() ? (1 << 1) : 0)
+        | (autonomousAccValid ? (1 << 2) : 0)
+        | ((isRxReceivingSignal() && rxAreFlightChannelsValid()) ? (1 << 3) : 0);
+    blackboxCurrent->autonomousArmResult = autonomousModeGetArmResult();
+    blackboxCurrent->autonomousArmBlockingFlags = (int32_t)autonomousModeGetArmBlockingFlags();
+    timeUs_t throttleTimeUs;
+    uint16_t finalThrottlePwm;
+    if (mixerGetFinalThrottle(&finalThrottlePwm, &throttleTimeUs)) {
+        blackboxCurrent->autonomousThrottlePwm = finalThrottlePwm;
+        blackboxCurrent->autonomousControlStatus |= 1 << 7;
+    }
+#ifndef USE_WING
+    // Control status: bits 0/1 mode flags, 2/3 active controllers, 4/5 usable
+    // Z/XY samples, 6 real position anchor (else virtual error), 7 final throttle.
+    blackboxCurrent->autonomousControlStatus |= (FLIGHT_MODE(ALT_HOLD_MODE) ? 1 << 0 : 0)
+        | (FLIGHT_MODE(POS_HOLD_MODE) ? 1 << 1 : 0);
+#ifdef USE_ALTITUDE_HOLD
+    if (FLIGHT_MODE(ALT_HOLD_MODE) && isAltHoldActive()) {
+        blackboxCurrent->autonomousControlStatus |= 1 << 2;
+        altitudeControlTelemetry_t sample;
+        if (isAltitudeAvailable() && autopilotGetAltitudeTelemetry(&sample)) {
+            blackboxCurrent->autonomousControlStatus |= 1 << 4;
+            blackboxCurrent->autonomousTargetAltitudeCm = lrintf(sample.targetAltitudeCm);
+            blackboxCurrent->autonomousAltitudeCm = lrintf(sample.altitudeCm);
+            blackboxCurrent->autonomousTargetVerticalVelocityCmS = lrintf(sample.targetVelocityCmS);
+            blackboxCurrent->autonomousVerticalVelocityCmS = lrintf(sample.velocityCmS);
+        }
+    }
+#endif
+#ifdef USE_POSITION_HOLD
+    if (FLIGHT_MODE(POS_HOLD_MODE) && isAutopilotInControl()) {
+        blackboxCurrent->autonomousControlStatus |= 1 << 3;
+        positionControlTelemetry_t sample;
+        if (positionEstimatorIsValidXY() && autopilotGetPositionTelemetry(&sample)) {
+            blackboxCurrent->autonomousControlStatus |= (1 << 5) | (sample.positionAnchored ? 1 << 6 : 0);
+            blackboxCurrent->autonomousHorizontalDistanceCm = lrintf(vector2Norm(&sample.distanceErrorCm));
+            blackboxCurrent->autonomousTargetHorizontalVelocityCmS = lrintf(vector2Norm(&sample.targetVelocityCmS));
+            blackboxCurrent->autonomousHorizontalVelocityCmS = lrintf(vector2Norm(&sample.velocityCmS));
+        }
+    }
+#endif
+#endif // !USE_WING
 #if defined(USE_ACC) // IMU quaternion
     {
         // write x,y,z of IMU quaternion. Make sure that w is always positive

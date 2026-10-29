@@ -154,6 +154,9 @@ const OSD_Entry menuOsdActiveElemsEntries[] =
 #endif
     {"DEBUG",              OME_VISIBLE | DYNAMIC, NULL, &osdConfig_item_pos[OSD_DEBUG]},
     {"DEBUG2",             OME_VISIBLE | DYNAMIC, NULL, &osdConfig_item_pos[OSD_DEBUG2]},
+    {"AUTONOMOUS STATUS",  OME_VISIBLE | DYNAMIC, NULL, &osdConfig_item_pos[OSD_AUTONOMOUS_STATUS]},
+    {"AUTO VALIDITY",      OME_VISIBLE | DYNAMIC, NULL, &osdConfig_item_pos[OSD_AUTONOMOUS_VALIDITY]},
+    {"AUTO MOTION",        OME_VISIBLE | DYNAMIC, NULL, &osdConfig_item_pos[OSD_AUTONOMOUS_MOTION]},
     {"WARNINGS",           OME_VISIBLE | DYNAMIC, NULL, &osdConfig_item_pos[OSD_WARNINGS]},
     {"DISARMED",           OME_VISIBLE | DYNAMIC, NULL, &osdConfig_item_pos[OSD_DISARMED]},
     {"PIT ANG",            OME_VISIBLE | DYNAMIC, NULL, &osdConfig_item_pos[OSD_PITCH_ANGLE]},

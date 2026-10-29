@@ -16,26 +16,41 @@
 #include "flight/autonomous_mode.h"
 
 #include "flight/autopilot_multirotor.h"
+#ifdef USE_ALTITUDE_HOLD
+#include "flight/alt_hold_multirotor.h"
+#endif
 #include "flight/failsafe.h"
 #include "flight/imu.h"
 #include "flight/pid.h"
 #include "flight/position.h"
 #include "flight/position_estimator.h"
+#ifdef USE_POSITION_HOLD
+#include "flight/pos_hold_multirotor.h"
+#endif
 #include "sensors/acceleration.h"
 #include "sensors/gyro.h"
 
-#define AUTONOMOUS_FREEFALL_ACCEL_THRESHOLD_G 0.30f // 自由落体确认阈值，单位：G
-#define AUTONOMOUS_FREEFALL_CONFIRM_TIME_US 100000 // 自由落体持续确认时间，单位：us
+#define AUTONOMOUS_FREEFALL_ACCEL_THRESHOLD_G 0.80f // 自由落体确认阈值，单位：G
+#define AUTONOMOUS_FREEFALL_CONFIRM_TIME_US 30000 // 自由落体持续确认时间，单位：us
+#ifndef AUTONOMOUS_STATE3_LEVEL_CHECK_ENABLED
+#define AUTONOMOUS_STATE3_LEVEL_CHECK_ENABLED 1 // 1：检查姿态并等待0.5s；0：ANGLE/ALTHOLD生效后直接进入阶段4
+#endif
+#define AUTONOMOUS_STATE3_LEVEL_ANGLE_DEG 20.0f // 阶段3横滚/俯仰绝对值须严格小于此角度，单位：deg
+#define AUTONOMOUS_STATE3_LEVEL_TIME_US 500000 // 阶段3姿态及 ANGLE/ALTHOLD 连续有效时间，单位：us
 
+#if 0 // 简化流程暂时停用：旧翻转、姿态计时及自定义刹车。
 #define AUTONOMOUS_HOVER_STABLE_TIME_US 500000 // 悬停稳定持续时间，单位：us
 #define AUTONOMOUS_HOVER_STABLE_RATE_DPS 30 // 悬停稳定角速度阈值，单位：dps
 #define AUTONOMOUS_HOVER_LEVEL_ANGLE_DEG 5.0f // 悬停判定最大横滚/俯仰角，单位：deg
 #define AUTONOMOUS_HOVER_ABORT_ANGLE_DEG 70.0f // 已稳定悬停后重新进入调平的倾角，单位：deg
 #define AUTONOMOUS_HOVER_ABORT_CONFIRM_US 300000 // 已悬停后回到调平阶段的大倾角确认时间，单位：us
 
-#define AUTONOMOUS_USER1_POSITION_CHANGE_CONFIRM_US 30000 // USER1 拨杆位置变化确认时间，单位：us
-#define AUTONOMOUS_USER2_ARM_DELAY_US 1000000 // USER2 触发后进入自主解锁检测前的延时，单位：us
+#endif
 
+#define AUTONOMOUS_USER1_POSITION_CHANGE_CONFIRM_US 30000 // USER1 拨杆位置变化确认时间，单位：us
+#define AUTONOMOUS_USER2_ARM_DELAY_US 200000 // USER2 触发后进入自主解锁检测前的延时，单位：us
+
+#if 0 // 简化流程暂时停用：旧翻转、姿态计时及自定义刹车。
 #define AUTONOMOUS_FLIP_THROTTLE_RATIO 0.75f // 翻身油门初始值使用悬停油门余量的比例
 #define AUTONOMOUS_FLIP_THROTTLE_MIN_RATIO 0.30f // 翻身闭环油门下限使用悬停油门余量的比例
 #define AUTONOMOUS_FLIP_THROTTLE_MAX_RATIO 1.5f // 翻身闭环油门上限使用悬停油门余量的比例
@@ -46,9 +61,9 @@
 #define AUTONOMOUS_FLIP_RATE_KP_PWM_PER_DPS 0.15f // 角速度误差到油门修正的比例增益
 #define AUTONOMOUS_FLIP_THROTTLE_SLEW_PWM_PER_S 600.0f // 翻身油门最大变化速度，单位：PWM/s
 #define AUTONOMOUS_FLIP_START_COS_TILT 0.20f // 进入/结束翻身的 cos 倾角阈值
-#define AUTONOMOUS_FLIP_END_COS_TILT 0.90f // 结束翻身时要求倾角小于约26度
+#define AUTONOMOUS_FLIP_END_COS_TILT 0.50f // 结束翻身时要求倾角小于约60度，随后交给 ANGLE 回正
 #define AUTONOMOUS_FLIP_HANDOFF_RATE_DPS 30.0f // 翻身交给调平阶段前允许的翻身指令角速度，单位：deg/s
-#define AUTONOMOUS_FLIP_TIMEOUT_US 1500000 // 翻身最大允许时间，单位：us
+#define AUTONOMOUS_FLIP_TIMEOUT_US 2000000 // 翻身最大允许时间，单位：us
 #define AUTONOMOUS_FLIP_EXIT_STABLE_TIME_US 100000 // 翻身退出条件需连续满足的时间，单位：us
 
 #define AUTONOMOUS_ENTRY_THROTTLE_RATIO 1.00f // 入口时使用悬停油门余量的比例（相对 PWM 1000）
@@ -70,11 +85,21 @@
 #define AUTONOMOUS_BRAKE_ANGLE_VZ_SCALE_CM_S 300.0f // 开始降低水平倾角比例的垂直速度，单位：cm/s
 #define AUTONOMOUS_BRAKE_MIN_ANGLE_SCALE 0.35f // 快速下降时允许的最小水平倾角比例
 
+#endif
+
 static autonomousModeState_e autonomousModeState = AUTONOMOUS_MODE_IDLE;
+
+// Blackbox diagnostics for autonomous arming. Keep the last attempt visible
+// after the state machine returns to IDLE so the failure survives long enough
+// to be read from a later frame.
+static uint32_t autonomousArmBlockingFlags = 0;
+static autonomousArmResult_e autonomousArmResult = AUTONOMOUS_ARM_RESULT_NONE;
+static uint16_t autonomousArmAttemptCount = 0;
 
 static bool autonomousUser2SeenLow = false;
 static bool autonomousUser2WasActive = false;
 static bool autonomousArmWasActive = false;
+static bool autonomousUser4WasActive = false;
 static bool autonomousUser2CycleRequested = false;
 static bool autonomousUser2ArmDelayStarted = false;
 static timeUs_t autonomousUser2ArmDelayStartUs = 0;
@@ -84,6 +109,9 @@ static timeUs_t autonomousUser1PendingSinceUs = 0;
 
 static bool autonomousFreefallCandidateActive = false;
 static timeUs_t autonomousFreefallCandidateStartUs = 0;
+static bool autonomousState3LevelCandidateActive = false;
+static timeUs_t autonomousState3LevelSinceUs = 0;
+#if 0 // 简化流程暂时停用：旧翻转、姿态计时及自定义刹车。
 static bool autonomousHoverStableCandidateActive = false;
 static timeUs_t autonomousHoverStableStartUs = 0;
 static flight_dynamics_index_t autonomousFlipAxis = FD_ROLL;
@@ -104,11 +132,11 @@ static vector2_t autonomousBrakeTargetPosition;
 static vector2_t autonomousBrakeTargetVelocity;
 static vector2_t autonomousBrakeAccelerationXY;
 static bool autonomousBrakePositionLocked;
+static bool autonomousBrakingComplete;
 static timeUs_t autonomousBrakeLastUpdateUs;
 static timeUs_t autonomousBrakeStableSinceUs;
 
 static void autonomousModeStartFlip(timeUs_t currentTimeUs);
-static void autonomousModeUpdateFlipControl(timeUs_t currentTimeUs);
 static void autonomousModeResetFlip(void);
 static void autonomousModeResetBraking(void);
 static void autonomousModeStartBraking(timeUs_t currentTimeUs);
@@ -124,6 +152,8 @@ static uint16_t autonomousModeThrottleFromHoverRatio(const float ratio)
         (float)PWM_RANGE_MAX));
 }
 
+#endif
+
 // [新增] 功能：清除自由落体候选检测状态。
 static void autonomousModeResetFreefallDetection(void)
 {
@@ -131,6 +161,7 @@ static void autonomousModeResetFreefallDetection(void)
     autonomousFreefallCandidateStartUs = 0;
 }
 
+#if 0 // 简化流程暂时停用：旧翻转、姿态计时及自定义刹车。
 // [新增] 功能：清除悬停稳定候选检测状态。
 static void autonomousModeResetHoverStability(void)
 {
@@ -162,15 +193,6 @@ static bool autonomousModeConfirmForDuration(const bool condition, const timeUs_
     return cmpTimeUs(currentTimeUs, *sinceUs) >= durationUs;
 }
 
-static bool autonomousModeEntryAttitudeStable(void)
-{
-    return fabsf((float)attitude.values.roll) * 0.1f <= AUTONOMOUS_ENTRY_LEVEL_ANGLE_DEG
-        && fabsf((float)attitude.values.pitch) * 0.1f <= AUTONOMOUS_ENTRY_LEVEL_ANGLE_DEG
-        && gyroAbsRateDps(FD_ROLL) <= AUTONOMOUS_ENTRY_STABLE_RATE_DPS
-        && gyroAbsRateDps(FD_PITCH) <= AUTONOMOUS_ENTRY_STABLE_RATE_DPS
-        && gyroAbsRateDps(FD_YAW) <= AUTONOMOUS_ENTRY_STABLE_RATE_DPS;
-}
-
 static bool autonomousModeTiltReentryConfirmed(const timeUs_t currentTimeUs)
 {
     const bool condition = sensors(SENSOR_ACC)
@@ -193,6 +215,8 @@ static bool autonomousModeHoverAbortConfirmed(const timeUs_t currentTimeUs)
         &autonomousHoverAbortSinceUs,
         AUTONOMOUS_HOVER_ABORT_CONFIRM_US);
 }
+
+#endif
 
 // [新增] 功能：通过 BOXUSER1 配置取得 AUX 通道并读取三段拨杆位置。
 // USER1 仅用于定位原始 RC 通道；LOW/MIDDLE/HIGH 不会直接启用任何飞行模式。
@@ -220,7 +244,7 @@ static autonomousUser1Position_e autonomousModeReadUser1Position(void)
     return AUTONOMOUS_USER1_POSITION_INVALID;
 }
 
-// [新增] 功能：复位自主状态机及其检测、翻转和 USER1 拨杆位置状态。
+// [新增] 功能：复位自主状态机、自由落体检测和 USER1 拨杆位置状态。
 static void autonomousModeResetToIdle(void)
 {
     // The active autonomous trigger owns the synthetic lock duration. An
@@ -230,10 +254,7 @@ static void autonomousModeResetToIdle(void)
         failsafeRequestAutonomousLock(false);
     }
     autonomousModeResetFreefallDetection();
-    autonomousModeResetHoverStability();
-    autonomousModeResetTransitionConfirmations();
-    autonomousModeResetFlip();
-    autonomousModeResetBraking();
+    autonomousState3LevelCandidateActive = false;
     autonomousModeState = AUTONOMOUS_MODE_IDLE;
     autonomousUser2CycleRequested = false;
     autonomousUser2ArmDelayStarted = false;
@@ -254,9 +275,6 @@ void autonomousModeStartAccelerationDetection(void)
     }
 
     autonomousModeResetFreefallDetection();
-    autonomousModeResetHoverStability();
-    autonomousModeResetTransitionConfirmations();
-    autonomousModeResetBraking();
     autonomousModeState = AUTONOMOUS_MODE_ACCEL_WAITING;
 
 #ifdef SITL
@@ -276,100 +294,157 @@ bool autonomousModeOwnsArming(void)
     return autonomousUser2CycleRequested && autonomousModeState != AUTONOMOUS_MODE_IDLE;
 }
 
+bool autonomousModeRequestsThrottleRaised(void)
+{
+    return autonomousModeOwnsArming();
+}
+
 // [新增] 功能：判断当前状态是否屏蔽飞手姿态输入。
 bool autonomousModeSuppressesPilotInput(void)
 {
-    return autonomousModeState == AUTONOMOUS_MODE_ACCEL_WAITING
-        || autonomousModeState == AUTONOMOUS_MODE_FLIP
-        || autonomousModeState == AUTONOMOUS_MODE_HOVER_ENTRY
-        || autonomousModeState == AUTONOMOUS_MODE_BRAKING
-        || autonomousModeState == AUTONOMOUS_MODE_READY;
+    return autonomousModeState >= AUTONOMOUS_MODE_ACCEL_WAITING
+        && autonomousModeState <= AUTONOMOUS_MODE_WAITING_FOR_AUTOPILOT;
 }
 
 // [新增] 功能：判断当前状态是否用自主悬停油门覆盖飞手油门。
 bool autonomousModeOverridesThrottle(void)
 {
-    return autonomousModeState == AUTONOMOUS_MODE_ACCEL_WAITING
-        || autonomousModeState == AUTONOMOUS_MODE_HOVER_ENTRY
-        || autonomousModeState == AUTONOMOUS_MODE_BRAKING
-        || autonomousModeState == AUTONOMOUS_MODE_READY;
+    return autonomousModeSuppressesPilotInput();
 }
 
-// 返回自主流程当前阶段使用的集体油门。调平入口阶段使用悬停油门的固定比例，
-// 避免因不同 ap_hover_throttle 配置导致入口推力失配。
+// 标准保持接管前使用悬停油门；保持期间提供中性 RC 油门基准。
 uint16_t autonomousModeGetThrottlePwm(void)
 {
-    if (autonomousModeState == AUTONOMOUS_MODE_HOVER_ENTRY
-        || autonomousModeState == AUTONOMOUS_MODE_BRAKING) {
-        return autonomousModeThrottleFromHoverRatio(AUTONOMOUS_ENTRY_THROTTLE_RATIO);
-    }
-
     return autopilotGetEffectiveHoverThrottlePwm();
 }
 
 // [新增] 功能：判断翻转控制是否正在执行。
 bool autonomousModeIsFlipActive(void)
 {
-    return autonomousModeState == AUTONOMOUS_MODE_FLIP;
+    return false;
 }
 
 // [新增] 功能：返回自主翻转阶段指定轴的角速度设定值。
 float autonomousModeGetFlipRate(int axis)
 {
-    if (!autonomousModeIsFlipActive() || axis != (int)autonomousFlipAxis) {
-        return 0.0f;
-    }
-
-    return autonomousFlipDirection * autonomousFlipRateDps;
+    UNUSED(axis);
+    return 0.0f;
 }
 
 // [新增] 功能：返回自主翻转阶段的油门 PWM 输出。
 uint16_t autonomousModeGetFlipThrottlePwm(void)
 {
-    return autonomousFlipThrottlePwm;
+    return 0;
 }
 
 // [新增] 功能：判断自主状态机是否请求 ANGLE 模式。
 bool autonomousModeRequestsAngle(void)
 {
-    return autonomousModeState == AUTONOMOUS_MODE_ACCEL_WAITING
-        || autonomousModeState == AUTONOMOUS_MODE_HOVER_ENTRY
-        || autonomousModeState == AUTONOMOUS_MODE_BRAKING
-        || autonomousModeState == AUTONOMOUS_MODE_READY;
+    return autonomousModeSuppressesPilotInput();
 }
 
 // [新增] 功能：判断自主状态机是否请求高度保持。
 bool autonomousModeRequestsAltitudeHold(void)
 {
-    return autonomousModeState == AUTONOMOUS_MODE_BRAKING
-        || autonomousModeState == AUTONOMOUS_MODE_READY;
+    return autonomousModeState >= AUTONOMOUS_MODE_REQUESTING_HOLD
+        && autonomousModeState <= AUTONOMOUS_MODE_WAITING_FOR_AUTOPILOT;
 }
 
 // [新增] 功能：判断自主状态机是否请求位置保持。
 bool autonomousModeRequestsPositionHold(void)
 {
-    // Keep PX4-style horizontal braking active during BRAKING, then request
-    // final position hold after READY has captured a valid position anchor.
-    return positionEstimatorIsValidXY()
-        && (autonomousModeState == AUTONOMOUS_MODE_BRAKING
-            || (autonomousModeState == AUTONOMOUS_MODE_READY
-                && autonomousBrakePositionLocked));
+    return autonomousModeState >= AUTONOMOUS_MODE_REQUESTING_POSITION_HOLD
+        && autonomousModeState <= AUTONOMOUS_MODE_WAITING_FOR_AUTOPILOT;
+}
+
+bool autonomousModeRequestsAutopilot(void)
+{
+    return (autonomousModeState == AUTONOMOUS_MODE_REQUESTING_AUTOPILOT
+            || autonomousModeState == AUTONOMOUS_MODE_WAITING_FOR_AUTOPILOT
+            || autonomousModeState == AUTONOMOUS_MODE_AUTOPILOT)
+        && IS_RC_MODE_ACTIVE(BOXUSER4)
+        && autonomousModeOwnsArming();
+}
+
+void autonomousModeOnAutopilotRequested(void)
+{
+    // Called when processRxModes consumes the autonomous request, independently
+    // of the sensor/throttle gates that enable the actual AUTOPILOT_MODE flag.
+    if (autonomousModeState == AUTONOMOUS_MODE_REQUESTING_AUTOPILOT
+        && autonomousModeRequestsAutopilot()) {
+        autonomousModeState = AUTONOMOUS_MODE_WAITING_FOR_AUTOPILOT;
+#ifdef SITL
+        printf("[AUTO] stage 7: AUTOPILOT request submitted\n");
+#endif
+    }
+}
+
+void autonomousModeOnAutopilotActivated(void)
+{
+    if (autonomousModeState == AUTONOMOUS_MODE_WAITING_FOR_AUTOPILOT
+        && autonomousModeRequestsAutopilot()
+        && FLIGHT_MODE(AUTOPILOT_MODE)) {
+        autonomousModeState = AUTONOMOUS_MODE_AUTOPILOT;
+#ifdef SITL
+        printf("[AUTO] stage 8: AUTOPILOT_MODE confirmed\n");
+#endif
+    }
+}
+
+static bool autonomousModeAltitudeHoldActive(void)
+{
+#ifdef USE_ALTITUDE_HOLD
+    return FLIGHT_MODE(ANGLE_MODE)
+        && FLIGHT_MODE(ALT_HOLD_MODE)
+        && isAltHoldActive();
+#else
+    return false;
+#endif
+}
+
+static bool autonomousModeState3LevelConfirmed(const timeUs_t currentTimeUs)
+{
+    if (!AUTONOMOUS_STATE3_LEVEL_CHECK_ENABLED) {
+        return autonomousModeAltitudeHoldActive();
+    }
+    // attitude is stored in deci-degrees. Both axes and hold must remain valid.
+    const bool condition = autonomousModeAltitudeHoldActive()
+        && fabsf((float)attitude.values.roll) * 0.1f < AUTONOMOUS_STATE3_LEVEL_ANGLE_DEG
+        && fabsf((float)attitude.values.pitch) * 0.1f < AUTONOMOUS_STATE3_LEVEL_ANGLE_DEG;
+    if (!condition) {
+        autonomousState3LevelCandidateActive = false;
+        return false;
+    }
+    if (!autonomousState3LevelCandidateActive) {
+        autonomousState3LevelCandidateActive = true;
+        autonomousState3LevelSinceUs = currentTimeUs;
+        return false;
+    }
+    return cmpTimeUs(currentTimeUs, autonomousState3LevelSinceUs) >= AUTONOMOUS_STATE3_LEVEL_TIME_US;
+}
+
+static bool autonomousModeHoldControllersActive(void)
+{
+#ifdef USE_POSITION_HOLD
+    return autonomousModeAltitudeHoldActive()
+        && FLIGHT_MODE(POS_HOLD_MODE)
+        && isAutopilotInControl();
+#else
+    return false;
+#endif
 }
 
 // [新增] 功能：判断是否暂时屏蔽飞手的高度/位置保持模式请求。
 bool autonomousModeSuppressesPilotHoldModes(void)
 {
-    return autonomousModeState == AUTONOMOUS_MODE_ACCEL_WAITING
-        || autonomousModeState == AUTONOMOUS_MODE_FLIP
-        || autonomousModeState == AUTONOMOUS_MODE_HOVER_ENTRY
-        || autonomousModeState == AUTONOMOUS_MODE_BRAKING
-        || autonomousModeState == AUTONOMOUS_MODE_READY;
+    return autonomousModeOwnsArming();
 }
 
 bool autonomousModeGetAltitudeSetpoint(float *targetAltitudeCm, float *targetVelocityCmS)
 {
+#if 0 // 旧自定义轨迹接口停用，使用标准 ALTHOLD/POSHOLD。
     if (autonomousModeState != AUTONOMOUS_MODE_BRAKING
-        && autonomousModeState != AUTONOMOUS_MODE_READY) {
+        && autonomousModeState != AUTONOMOUS_MODE_WAITING_FOR_AUTOPILOT) {
         return false;
     }
     if (targetAltitudeCm != NULL) {
@@ -379,14 +454,18 @@ bool autonomousModeGetAltitudeSetpoint(float *targetAltitudeCm, float *targetVel
         *targetVelocityCmS = autonomousBrakeTargetVelocityZCmS;
     }
     return true;
+#endif
+    UNUSED(targetAltitudeCm);
+    UNUSED(targetVelocityCmS);
+    return false;
 }
 
 bool autonomousModeGetPositionSetpoint(vector2_t *targetPosition, vector2_t *targetVelocity, bool *positionLocked, float *angleLimitScale)
 {
-    // Consume the horizontal braking trajectory during BRAKING and the
-    // captured position anchor during the final READY state.
+#if 0 // 旧自定义轨迹接口停用，使用标准 ALTHOLD/POSHOLD。
+    // Stages 5/6 share the braking trajectory and captured hover anchor.
     if ((autonomousModeState != AUTONOMOUS_MODE_BRAKING
-         && autonomousModeState != AUTONOMOUS_MODE_READY)
+         && autonomousModeState != AUTONOMOUS_MODE_WAITING_FOR_AUTOPILOT)
         || !positionEstimatorIsValidXY()) {
         return false;
     }
@@ -407,6 +486,12 @@ bool autonomousModeGetPositionSetpoint(vector2_t *targetPosition, vector2_t *tar
             1.0f);
     }
     return true;
+#endif
+    UNUSED(targetPosition);
+    UNUSED(targetVelocity);
+    UNUSED(positionLocked);
+    UNUSED(angleLimitScale);
+    return false;
 }
 
 // [新增] 功能：返回当前自主状态机状态。
@@ -415,9 +500,34 @@ autonomousModeState_e autonomousModeGetState(void)
     return autonomousModeState;
 }
 
+void autonomousModeRecordArmAttempt(const bool success, const uint32_t blockingFlags,
+    const autonomousArmResult_e result)
+{
+    if (autonomousArmAttemptCount != UINT16_MAX) {
+        autonomousArmAttemptCount++;
+    }
+    autonomousArmBlockingFlags = blockingFlags;
+    autonomousArmResult = success ? AUTONOMOUS_ARM_RESULT_SUCCESS : result;
+}
+
+uint32_t autonomousModeGetArmBlockingFlags(void)
+{
+    return autonomousArmBlockingFlags;
+}
+
+autonomousArmResult_e autonomousModeGetArmResult(void)
+{
+    return autonomousArmResult;
+}
+
+uint16_t autonomousModeGetArmAttemptCount(void)
+{
+    return autonomousArmAttemptCount;
+}
+
 bool autonomousModeIsBraking(void)
 {
-    return autonomousModeState == AUTONOMOUS_MODE_BRAKING;
+    return false;
 }
 
 // [新增] 功能：返回当前 USER1 拨杆位置。
@@ -438,7 +548,19 @@ bool autonomousModeUserRequestsPositionHold(void)
     return false;
 }
 
-// [新增] 功能：按周期推进 USER2 自主解锁、自由落体、翻转和悬停状态机。
+// Arm only after freefall confirmation.
+static void autonomousModeTryArm(timeUs_t currentTimeUs)
+{
+    UNUSED(currentTimeUs);
+    autonomousModeResetFreefallDetection();
+    unsetArmingDisabled(ARMING_DISABLED_ARM_SWITCH);
+    unsetArmingDisabled(ARMING_DISABLED_NOT_DISARMED);
+    if (tryArmAutonomous()) {
+        autonomousModeState = AUTONOMOUS_MODE_REQUESTING_HOLD;
+    }
+}
+
+// [新增] 功能：按周期推进自主解锁、自由落体、标准保持及航线接管状态机。
 void autonomousModeUpdate(timeUs_t currentTimeUs)
 {
     #ifdef SITL
@@ -469,6 +591,9 @@ void autonomousModeUpdate(timeUs_t currentTimeUs)
 
     const bool user2Active = IS_RC_MODE_ACTIVE(BOXUSER2);
     const bool user3Active = IS_RC_MODE_ACTIVE(BOXUSER3);
+    const bool user4Active = IS_RC_MODE_ACTIVE(BOXUSER4);
+    const bool user4RisingEdge = user4Active && !autonomousUser4WasActive;
+    autonomousUser4WasActive = user4Active;
     const bool armActive = IS_RC_MODE_ACTIVE(BOXARM);
     const bool user2WasSeenLow = autonomousUser2SeenLow;
     const bool user2RisingEdge = user2Active && !autonomousUser2WasActive && user2WasSeenLow;
@@ -559,8 +684,21 @@ void autonomousModeUpdate(timeUs_t currentTimeUs)
         return;
     }
 
+    // Edges are sampled even before stage 5: an early held USER4 cannot queue a request.
+    const bool handoffReady = ARMING_FLAG(ARMED)
+        && autonomousModeHoldControllersActive()
+        && rxAreFlightChannelsValid()
+        && failsafeIsReceivingRxData();
+
     switch (autonomousModeState) {
     case AUTONOMOUS_MODE_IDLE:
+        return;
+
+    case AUTONOMOUS_MODE_AUTOPILOT:
+        if (!autonomousModeRequestsAutopilot() || !FLIGHT_MODE(AUTOPILOT_MODE)) {
+            // Resume standard hold at the current state, without old braking targets.
+            autonomousModeState = AUTONOMOUS_MODE_REQUESTING_HOLD;
+        }
         return;
 
     case AUTONOMOUS_MODE_WAITING_FOR_ARM:
@@ -611,51 +749,59 @@ void autonomousModeUpdate(timeUs_t currentTimeUs)
         printf("[AUTO] freefall confirmed magnitude_mg=%ld\n",
             lrintf(acc.accMagnitude * 1000.0f));
 #endif
-        autonomousModeResetFreefallDetection();
-        unsetArmingDisabled(ARMING_DISABLED_ARM_SWITCH);
-        unsetArmingDisabled(ARMING_DISABLED_NOT_DISARMED);
-        if (tryArmAutonomous()) {
-            autonomousModeResetHoverStability();
-            autonomousModeResetTransitionConfirmations();
-            if (sensors(SENSOR_ACC)
-                && acc.isAccelUpdatedAtLeastOnce
-                && getCosTiltAngle() < AUTONOMOUS_FLIP_START_COS_TILT) {
-                autonomousModeStartFlip(currentTimeUs);
-                autonomousModeState = AUTONOMOUS_MODE_FLIP;
-            } else {
-                autonomousModeState = AUTONOMOUS_MODE_HOVER_ENTRY;
-            }
-        }
+        autonomousModeTryArm(currentTimeUs);
     }
     return;
 
+    case AUTONOMOUS_MODE_REQUESTING_HOLD:
+        // Confirm level attitude and ANGLE/ALTHOLD for 0.5 s before POSHOLD.
+        if (autonomousModeState3LevelConfirmed(currentTimeUs)) {
+            autonomousState3LevelCandidateActive = false;
+            autonomousModeState = AUTONOMOUS_MODE_REQUESTING_POSITION_HOLD;
+        }
+        return;
+
+    case AUTONOMOUS_MODE_REQUESTING_POSITION_HOLD:
+        if (!autonomousModeAltitudeHoldActive()) {
+            autonomousModeState = AUTONOMOUS_MODE_REQUESTING_HOLD;
+        } else if (autonomousModeHoldControllersActive()) {
+            autonomousModeState = AUTONOMOUS_MODE_HOLD;
+        }
+        return;
+
+    case AUTONOMOUS_MODE_HOLD:
+        if (!autonomousModeHoldControllersActive()) {
+            autonomousModeState = AUTONOMOUS_MODE_REQUESTING_HOLD;
+        } else if (user4RisingEdge && handoffReady) {
+            autonomousModeState = AUTONOMOUS_MODE_REQUESTING_AUTOPILOT;
+#ifdef SITL
+            printf("[AUTO] stage 6: USER4 enabled\n");
+#endif
+        }
+        return;
+
+    case AUTONOMOUS_MODE_REQUESTING_AUTOPILOT:
+    case AUTONOMOUS_MODE_WAITING_FOR_AUTOPILOT:
+        if (!user4Active || !handoffReady) {
+            autonomousModeState = autonomousModeHoldControllersActive()
+                ? AUTONOMOUS_MODE_HOLD : AUTONOMOUS_MODE_REQUESTING_HOLD;
+        } else {
+            // Request acceptance alone is insufficient: verify the internal mode flag.
+            autonomousModeOnAutopilotActivated();
+        }
+        return;
+    }
+}
+
+#if 0 // 旧阶段分支保留供参考，简化流程不执行翻转/自定义刹车/READY/姿态重入。
     case AUTONOMOUS_MODE_FLIP:
         if (!ARMING_FLAG(ARMED)) {
             autonomousModeResetToIdle();
             return;
         }
 
-        if (cmpTimeUs(currentTimeUs, autonomousFlipStartUs) >= AUTONOMOUS_FLIP_TIMEOUT_US) {
-            disarm(DISARM_REASON_CRASH_PROTECTION);
-            autonomousModeResetToIdle();
-            return;
-        }
-
-        autonomousModeUpdateFlipControl(currentTimeUs);
-        // The trajectory controller reduces the flip command before the
-        // aircraft reaches the handoff angle. Let HOVER_ENTRY take over once
-        // the command is stopped; it will use Angle mode to remove any
-        // remaining measured angular rate and then apply its stable-time gate.
-        const bool flipExitStable = getCosTiltAngle() >= AUTONOMOUS_FLIP_END_COS_TILT
-            && autonomousFlipRateDps <= AUTONOMOUS_FLIP_HANDOFF_RATE_DPS;
-        if (autonomousModeConfirmForDuration(
-                flipExitStable,
-                currentTimeUs,
-                &autonomousFlipExitStableSinceUs,
-                AUTONOMOUS_FLIP_EXIT_STABLE_TIME_US)) {
-            autonomousFlipRateDps = 0.0f;
-            autonomousModeResetHoverStability();
-            autonomousEntryStableSinceUs = 0;
+        if (autonomousModeState3LevelConfirmed(currentTimeUs)) {
+            autonomousModeResetTransitionConfirmations();
             autonomousModeState = AUTONOMOUS_MODE_HOVER_ENTRY;
         }
         return;
@@ -666,28 +812,14 @@ void autonomousModeUpdate(timeUs_t currentTimeUs)
             return;
         }
 
-        // 姿态数据可能在解锁后才更新；如果此时发现倒扣，补进翻转流程。
-        if (autonomousModeTiltReentryConfirmed(currentTimeUs)) {
-            autonomousModeStartFlip(currentTimeUs);
-            autonomousModeState = AUTONOMOUS_MODE_FLIP;
-            return;
-        }
-
-        // Start vertical arrest only after the attitude is level and rate-stable
-        // for a continuous interval. The conservative entry throttle remains in use.
-        const bool entryStable = positionEstimatorIsValidZ()
-            && autonomousModeEntryAttitudeStable();
-        if (autonomousModeConfirmForDuration(
-                entryStable,
-                currentTimeUs,
-                &autonomousEntryStableSinceUs,
-                AUTONOMOUS_ENTRY_STABLE_TIME_US)) {
+        if (autonomousModeHoldControllersActive()) {
             autonomousModeStartBraking(currentTimeUs);
             autonomousModeState = AUTONOMOUS_MODE_BRAKING;
         }
         return;
 
     case AUTONOMOUS_MODE_BRAKING:
+    case AUTONOMOUS_MODE_WAITING_FOR_AUTOPILOT:
         if (!ARMING_FLAG(ARMED)) {
             autonomousModeResetToIdle();
             return;
@@ -705,23 +837,8 @@ void autonomousModeUpdate(timeUs_t currentTimeUs)
             return;
         }
 
-        autonomousModeUpdateBraking(currentTimeUs);
-        return;
-
-    case AUTONOMOUS_MODE_READY:
-        if (!ARMING_FLAG(ARMED)) {
-            autonomousModeResetToIdle();
-            return;
-        }
-
-        if (autonomousModeTiltReentryConfirmed(currentTimeUs)) {
-            autonomousModeResetBraking();
-            autonomousModeStartFlip(currentTimeUs);
-            autonomousModeState = AUTONOMOUS_MODE_FLIP;
-            return;
-        }
-
-        if (!positionEstimatorIsValidZ()) {
+        if (!autonomousBrakingComplete) {
+            autonomousModeUpdateBraking(currentTimeUs);
             return;
         }
 
@@ -770,6 +887,9 @@ void autonomousModeUpdate(timeUs_t currentTimeUs)
 
     }
 }
+#endif
+
+#if 0 // 旧自定义刹车和翻转实现暂时停用。
 
 static float autonomousModeSlew(const float current, const float target, const float maxChange)
 {
@@ -778,6 +898,7 @@ static float autonomousModeSlew(const float current, const float target, const f
 
 static void autonomousModeResetBraking(void)
 {
+    autonomousBrakingComplete = false;
     autonomousBrakeTargetAltitudeCm = 0.0f;
     autonomousBrakeTargetVelocityZCmS = 0.0f;
     autonomousBrakeAccelerationZCmS2 = 0.0f;
@@ -791,6 +912,7 @@ static void autonomousModeResetBraking(void)
 
 static void autonomousModeStartBraking(timeUs_t currentTimeUs)
 {
+    autonomousBrakingComplete = false;
     const positionEstimate3d_t *estimate = positionEstimatorGetEstimate();
 
     autonomousBrakeTargetAltitudeCm = estimate->position.v[ENU_U];
@@ -895,12 +1017,12 @@ static void autonomousModeUpdateBraking(timeUs_t currentTimeUs)
             autonomousBrakeTargetAltitudeCm = estimate->position.v[ENU_U];
             autonomousBrakeTargetVelocityZCmS = 0.0f;
             autonomousBrakeAccelerationZCmS2 = 0.0f;
-            // READY uses the captured position as a true hold target. Do not
+            // Hover uses the captured position as a true hold target. Do not
             // carry the small residual braking trajectory into final POS_HOLD.
             autonomousBrakeTargetVelocity = (vector2_t){{ 0.0f, 0.0f }};
             autonomousBrakeAccelerationXY = (vector2_t){{ 0.0f, 0.0f }};
             autonomousHoverAbortSinceUs = 0;
-            autonomousModeState = AUTONOMOUS_MODE_READY;
+            autonomousBrakingComplete = true;
         }
     } else {
         autonomousBrakeStableSinceUs = 0;
@@ -954,45 +1076,4 @@ static void autonomousModeStartFlip(timeUs_t currentTimeUs)
     pidResetIterm();
 }
 
-// [新增] 功能：根据倾角和角速度闭环更新翻转角速度及油门。
-static void autonomousModeUpdateFlipControl(timeUs_t currentTimeUs)
-{
-    const timeDelta_t elapsedUs = cmpTimeUs(currentTimeUs, autonomousFlipLastUpdateUs);
-    const float dt = constrainf((float)elapsedUs * 1e-6f, 0.0005f, 0.01f);
-    const float cosTilt = constrainf(getCosTiltAngle(), -1.0f, 1.0f);
-    const float tiltAngleDeg = acosf(cosTilt) * (180.0f / M_PIf);
-    const float handoffAngleDeg = acosf(AUTONOMOUS_FLIP_END_COS_TILT) * (180.0f / M_PIf);
-    const float remainingAngleDeg = fmaxf(tiltAngleDeg - handoffAngleDeg, 0.0f);
-    // PX4-style stopping-distance limit: the closer the aircraft is to the
-    // handoff angle, the lower the angular speed that can still be safely held.
-    const float brakeLimitedRate = sqrtf(
-        2.0f * AUTONOMOUS_FLIP_BRAKE_ACCEL_DPS2 * remainingAngleDeg);
-    const float targetRate = fminf(AUTONOMOUS_FLIP_RATE_DPS, brakeLimitedRate);
-    const float actualRate = fabsf(gyro.gyroADCf[autonomousFlipAxis]);
-    const float flipThrottle = (float)autonomousModeThrottleFromHoverRatio(AUTONOMOUS_FLIP_THROTTLE_RATIO);
-    const float flipThrottleMin = (float)autonomousModeThrottleFromHoverRatio(AUTONOMOUS_FLIP_THROTTLE_MIN_RATIO);
-    const float flipThrottleMax = (float)autonomousModeThrottleFromHoverRatio(AUTONOMOUS_FLIP_THROTTLE_MAX_RATIO);
-    const float rateError = targetRate - actualRate;
-    const float targetThrottle = constrainf(
-        flipThrottle + rateError * AUTONOMOUS_FLIP_RATE_KP_PWM_PER_DPS,
-        flipThrottleMin,
-        flipThrottleMax);
-    const float maxThrottleChange = AUTONOMOUS_FLIP_THROTTLE_SLEW_PWM_PER_S * dt;
-
-    autonomousFlipThrottlePwm = (uint16_t)lrintf(constrainf(
-        targetThrottle,
-        (float)autonomousFlipThrottlePwm - maxThrottleChange,
-        (float)autonomousFlipThrottlePwm + maxThrottleChange));
-    const float targetAcceleration = targetRate > autonomousFlipRateDps
-        ? AUTONOMOUS_FLIP_ACCEL_DPS2
-        : -AUTONOMOUS_FLIP_BRAKE_ACCEL_DPS2;
-    autonomousFlipAccelerationDps2 = autonomousModeSlew(
-        autonomousFlipAccelerationDps2,
-        targetAcceleration,
-        AUTONOMOUS_FLIP_MAX_JERK_DPS3 * dt);
-    autonomousFlipRateDps = constrainf(
-        autonomousFlipRateDps + autonomousFlipAccelerationDps2 * dt,
-        0.0f,
-        AUTONOMOUS_FLIP_RATE_DPS);
-    autonomousFlipLastUpdateUs = currentTimeUs;
-}
+#endif

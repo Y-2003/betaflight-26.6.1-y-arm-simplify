@@ -222,6 +222,11 @@ typedef enum {
     OSD_POS_HOLD_READY,         // pre-engagement Position Hold readiness indicator
 #endif
 
+    // Autonomous flight state, validity and motion data.
+    OSD_AUTONOMOUS_STATUS,
+    OSD_AUTONOMOUS_VALIDITY,
+    OSD_AUTONOMOUS_MOTION,
+
     OSD_ITEM_COUNT // MUST BE LAST
 } osd_items_e;
 

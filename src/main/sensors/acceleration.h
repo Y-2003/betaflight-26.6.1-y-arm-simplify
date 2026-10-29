@@ -70,6 +70,7 @@ typedef struct acc_s {
     float accMagnitude;                     // in multiples of 1G
     float jerkMagnitude;                    // in multiples of 1G/s (measure of collision strength)
     bool isAccelUpdatedAtLeastOnce;
+    bool isAccelDataValid;
 } acc_t;
 
 extern acc_t acc;

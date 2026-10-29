@@ -30,6 +30,12 @@ VPATH := $(VPATH):$(USER_DIR):$(TEST_DIR)
 #   <test_name>_EXPAND (run for each target, call the above with target as $1)
 #   <test_name>_BLACKLIST (targets to exclude from an expanded test's run)
 
+autonomous_mode_unittest_SRC := \
+		$(USER_DIR)/flight/autonomous_mode.c \
+		$(USER_DIR)/common/maths.c
+
+autonomous_mode_unittest_DEFINES := USE_ALTITUDE_HOLD= USE_POSITION_HOLD=
+
 alignsensor_unittest_SRC := \
 		$(USER_DIR)/sensors/boardalignment.c \
 		$(USER_DIR)/common/sensor_alignment.c \
@@ -557,6 +563,15 @@ pid_unittest_DEFINES := \
 position_rescue_geometry_unittest_SRC := \
 		$(USER_DIR)/common/maths.c
 
+
+mixer_telemetry_unittest_SRC := \
+		$(USER_DIR)/flight/mixer.c \
+		$(USER_DIR)/common/maths.c \
+		$(USER_DIR)/common/vector.c \
+		$(USER_DIR)/common/filter.c \
+		$(USER_DIR)/pg/rx.c
+
+mixer_telemetry_unittest_DEFINES := USE_ALTITUDE_HOLD=
 
 poshold_unittest_SRC := \
 		$(USER_DIR)/flight/autopilot_multirotor.c \

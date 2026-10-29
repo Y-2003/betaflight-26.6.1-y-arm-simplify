@@ -576,11 +576,19 @@ static bool tryArmInternal(bool autonomous)
     armingDisableFlags_e blockingFlags = getArmingDisableFlags();
 
     if(autonomous) {
-        blockingFlags &= ~(ARMING_DISABLED_ANGLE | ARMING_DISABLED_THROTTLE | ARMING_DISABLED_ARM_SWITCH);
+        blockingFlags &= ~(ARMING_DISABLED_ANGLE
+            | ARMING_DISABLED_THROTTLE
+            | ARMING_DISABLED_ARM_SWITCH
+            | ARMING_DISABLED_ALTHOLD
+            | ARMING_DISABLED_POSHOLD
+            | ARMING_DISABLED_AUTOPILOT);
     }
 
     if (!blockingFlags) {
         if (ARMING_FLAG(ARMED)) {
+            if (autonomous) {
+                autonomousModeRecordArmAttempt(true, 0, AUTONOMOUS_ARM_RESULT_SUCCESS);
+            }
             return true;
         }
         const timeUs_t currentTimeUs = micros();
@@ -598,6 +606,9 @@ if (beaconTimeDiff < DSHOT_BEACON_GUARD_DELAY_US && beaconTimeDiff >= 0) {
         {
             tryingToArm = ARMING_DELAYED_NORMAL;
         }
+    }
+    if (autonomous) {
+        autonomousModeRecordArmAttempt(false, 0, AUTONOMOUS_ARM_RESULT_DSHOT_GUARD);
     }
     return false;
 }
@@ -633,6 +644,10 @@ if (isMotorProtocolDshot()) {
         mixerResetRpmLimiter();
 #endif
         ENABLE_ARMING_FLAG(ARMED);  // ***ARM NOW ***
+
+        if (autonomous) {
+            autonomousModeRecordArmAttempt(true, 0, AUTONOMOUS_ARM_RESULT_SUCCESS);
+        }
 
         #ifdef SITL
         printf("[ARM] success autonomous=%d\n", autonomous ? 1 : 0);
@@ -690,6 +705,11 @@ if (isMotorProtocolDshot()) {
         return true;
     } else {
        resetTryingToArm();
+
+        if (autonomous) {
+            autonomousModeRecordArmAttempt(false, (uint32_t)blockingFlags,
+                AUTONOMOUS_ARM_RESULT_BLOCKED);
+        }
 
         if (!autonomous && !isFirstArmingGyroCalibrationRunning()) {
             int armingDisabledReason = ffs(getArmingDisableFlags());
@@ -874,7 +894,8 @@ bool processRx(timeUs_t currentTimeUs)
     static bool isAirmodeActive;
 
     if (ARMING_FLAG(ARMED)) {
-        if (throttlePercent >= rxConfig()->airModeActivateThreshold) {
+        if (throttlePercent >= rxConfig()->airModeActivateThreshold
+            || autonomousModeRequestsThrottleRaised()) {
             throttleRaised = true; // Latch true until disarm
         }
         if (isAirmodeEnabled() && !launchControlActive) {
@@ -1159,7 +1180,13 @@ void processRxModes(timeUs_t currentTimeUs)
     if (failsafeIsActive()) {
         autopilotRequested = (failsafePhase() == FAILSAFE_AUTOPILOT);
     } else if (rxAreFlightChannelsValid()) {
-        autopilotRequested = IS_RC_MODE_ACTIVE(BOXAUTOPILOT) || rescueSwitchRequest;
+        const bool autonomousAutopilotRequested = autonomousModeRequestsAutopilot();
+        autopilotRequested = (IS_RC_MODE_ACTIVE(BOXAUTOPILOT) && !autonomousModeOwnsArming())
+            || autonomousAutopilotRequested
+            || rescueSwitchRequest;
+        if (autonomousAutopilotRequested) {
+            autonomousModeOnAutopilotRequested();
+        }
     } else {
         autopilotRequested = FLIGHT_MODE(AUTOPILOT_MODE);
     }
@@ -1179,6 +1206,9 @@ void processRxModes(timeUs_t currentTimeUs)
             ENABLE_FLIGHT_MODE(AUTOPILOT_MODE);
             flightPlanNavEngage();
         }
+        // Release autonomous setpoints before the navigation/controller tasks
+        // consume this cycle's mission target.
+        autonomousModeOnAutopilotActivated();
         flightPlanNavUpdate(currentTimeUs);
     } else {
         if (FLIGHT_MODE(AUTOPILOT_MODE)) {
@@ -1226,7 +1256,8 @@ void processRxModes(timeUs_t currentTimeUs)
         // or an autopilot mission needs the position controller
         && (autonomousModeRequestsPositionHold()
             || (!autonomousModeSuppressesPilotHoldModes()
-                && ((IS_RC_MODE_ACTIVE(BOXPOSHOLD) || autonomousModeUserRequestsPositionHold()) || failsafeIsActive() || FLIGHT_MODE(AUTOPILOT_MODE))))
+                && (IS_RC_MODE_ACTIVE(BOXPOSHOLD) || autonomousModeUserRequestsPositionHold()))
+            || failsafeIsActive() || FLIGHT_MODE(AUTOPILOT_MODE))
         // and we have Acc for self-levelling
         && sensors(SENSOR_ACC)
         // but not until throttle is raised

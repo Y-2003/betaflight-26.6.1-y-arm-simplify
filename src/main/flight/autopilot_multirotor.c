@@ -32,6 +32,7 @@
 #include "fc/rc.h"
 #include "fc/rc_controls.h"
 #include "fc/runtime_config.h"
+#include "drivers/time.h"
 
 #include "flight/imu.h"
 #include "flight/autonomous_mode.h"
@@ -167,6 +168,22 @@ static float altitudeKf;
 static uint16_t altHoldCapturedHoverPwm;
 static float altitudeI = 0.0f;
 static float throttleOut = 0.0f;
+static altitudeControlTelemetry_t altitudeTelemetry;
+static positionControlTelemetry_t positionTelemetry;
+
+bool autopilotGetAltitudeTelemetry(altitudeControlTelemetry_t *sample)
+{
+    *sample = altitudeTelemetry;
+    const timeDelta_t ageUs = cmpTimeUs(micros(), sample->timeUs);
+    return sample->valid && ageUs >= 0 && ageUs < AUTOPILOT_TELEMETRY_TIMEOUT_US;
+}
+
+bool autopilotGetPositionTelemetry(positionControlTelemetry_t *sample)
+{
+    *sample = positionTelemetry;
+    const timeDelta_t ageUs = cmpTimeUs(micros(), sample->timeUs);
+    return sample->valid && ageUs >= 0 && ageUs < AUTOPILOT_TELEMETRY_TIMEOUT_US;
+}
 
 // (EF_EAST/EF_NORTH) is
 // defined in common/axis.h alongside the other earth-frame axis enums.
@@ -251,6 +268,8 @@ static void initPidLpfs(void)
 
 void autopilotInit(void)
 {
+    altitudeTelemetry.valid = false;
+    positionTelemetry.valid = false;
     const autopilotConfig_t *cfg = autopilotConfig();
     initPidLpfs();
 
@@ -287,6 +306,7 @@ void autopilotInit(void)
 
 void resetAltitudeControl(void)
 {
+    altitudeTelemetry.valid = false;
     altitudeI = 0.0f;
     throttleOut = 0.0f;
 }
@@ -374,6 +394,15 @@ void altitudeControl(float targetAltitudeCm, float taskIntervalS, float targetAl
     DEBUG_SET(DEBUG_AUTOPILOT_ALTITUDE, 5, lrintf(altitudeI));
     DEBUG_SET(DEBUG_AUTOPILOT_ALTITUDE, 6, lrintf(altitudeD)); // includes innate feedforward since D is from error
     DEBUG_SET(DEBUG_AUTOPILOT_ALTITUDE, 7, lrintf(altitudeF)); // feedforward
+    altitudeTelemetry = (altitudeControlTelemetry_t) {
+        .valid = isfinite(targetAltitudeCm) && isfinite(currentAltitudeCm)
+            && isfinite(targetVerticalVelocity) && isfinite(verticalVelocity),
+        .timeUs = micros(),
+        .targetAltitudeCm = targetAltitudeCm,
+        .altitudeCm = currentAltitudeCm,
+        .targetVelocityCmS = targetVerticalVelocity,
+        .velocityCmS = verticalVelocity,
+    };
 }
 
 static void updatePositionHoldTarget(void)
@@ -493,6 +522,7 @@ static void initNavMode(void)
 
 void resetPositionControl(unsigned taskRateHz)
 {
+    positionTelemetry.valid = false;
     UNUSED(taskRateHz);
     abortNavRequested = false;
     forcePitchForward = false;
@@ -693,6 +723,8 @@ static void updateYawControl(float dt, const positionEstimate3d_t *est)
 
 bool positionControl(void)
 {
+    // Failed/overridden iterations must not expose an earlier successful target.
+    positionTelemetry.valid = false;
 
     const positionEstimate3d_t *est = positionEstimatorGetEstimate();
     vector2_t autonomousTargetPosition;
@@ -1067,6 +1099,16 @@ bool positionControl(void)
     DEBUG_SET(DEBUG_POSITION_NAV, 6, lrintf(pidA.v[ap.debugAxis] * 10));
     DEBUG_SET(DEBUG_POSITION_NAV, 7, (anchorOff ? 10 : 0) + (buildupClamped ? 1 : 0));
 
+    positionTelemetry = (positionControlTelemetry_t) {
+        .valid = isfinite(distanceError.v[EF_EAST]) && isfinite(distanceError.v[EF_NORTH])
+            && isfinite(targetVelocity.v[EF_EAST]) && isfinite(targetVelocity.v[EF_NORTH])
+            && isfinite(velocity.v[EF_EAST]) && isfinite(velocity.v[EF_NORTH]),
+        .positionAnchored = !anchorOff,
+        .timeUs = micros(),
+        .distanceErrorCm = distanceError,
+        .targetVelocityCmS = targetVelocity,
+        .velocityCmS = velocity,
+    };
     return true;
 }
 

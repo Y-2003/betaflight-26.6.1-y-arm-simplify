@@ -23,6 +23,10 @@
 extern "C" {
 
     #include "platform.h"
+    #include "drivers/time.h"
+
+    static timeUs_t telemetryTimeUs;
+    timeUs_t micros(void) { return telemetryTimeUs; }
     #include "build/debug.h"
     #include "pg/pg_ids.h"
 
@@ -85,6 +89,7 @@ protected:
         memset(rcCommand, 0, sizeof(rcCommand));
         flightModeFlags = 0;
         millisRW = 0;
+        telemetryTimeUs = 1000000;
         testAltitudeCm = 0.0f;
         testAltitudeDerivativeCmS = 0.0f;
         testCosTiltAngle = 1.0f;
@@ -279,4 +284,27 @@ extern "C" {
     }
 
     throttleStatus_e calculateThrottleStatus() { return testThrottleStatus; }
+}
+
+TEST_F(AltholdControlUnittest, TelemetryUsesControlFeedbackAndLimitedTargetWithoutDebug)
+{
+    debugMode = DEBUG_NONE;
+    testAltitudeCm = 1234.5f;
+    testAltitudeDerivativeCmS = -87.25f;
+    altitudeControl(1500.5f, 0.01f, 900.0f, 200.0f);
+    altitudeControlTelemetry_t sample;
+    ASSERT_TRUE(autopilotGetAltitudeTelemetry(&sample));
+    EXPECT_FLOAT_EQ(sample.targetAltitudeCm, 1500.5f);
+    EXPECT_FLOAT_EQ(sample.altitudeCm, 1234.5f);
+    EXPECT_FLOAT_EQ(sample.targetVelocityCmS, 200.0f);
+    EXPECT_FLOAT_EQ(sample.velocityCmS, -87.25f);
+    EXPECT_EQ(sample.timeUs, telemetryTimeUs);
+
+    telemetryTimeUs += AUTOPILOT_TELEMETRY_TIMEOUT_US;
+    EXPECT_FALSE(autopilotGetAltitudeTelemetry(&sample));
+    altitudeControl(1600.0f, 0.01f, -900.0f, 200.0f);
+    ASSERT_TRUE(autopilotGetAltitudeTelemetry(&sample));
+    EXPECT_FLOAT_EQ(sample.targetVelocityCmS, -200.0f);
+    resetAltitudeControl();
+    EXPECT_FALSE(autopilotGetAltitudeTelemetry(&sample));
 }

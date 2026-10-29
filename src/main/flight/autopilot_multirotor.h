@@ -22,11 +22,36 @@
 
 #include "common/axis.h"
 #include "common/vector.h"
+#include "common/time.h"
 
 
 #ifndef USE_WING
 
 #define AP_HOVER_THROTTLE_DEFAULT 1275U
+
+// Samples of the values actually consumed by the control loops, before logging
+// or OSD rounding. Positions are cm, velocities cm/s, in ENU (Up positive).
+#define AUTOPILOT_TELEMETRY_TIMEOUT_US 100000
+typedef struct {
+    bool valid;
+    timeUs_t timeUs;
+    float targetAltitudeCm;
+    float altitudeCm;
+    float targetVelocityCmS;
+    float velocityCmS;
+} altitudeControlTelemetry_t;
+
+typedef struct {
+    bool valid;
+    bool positionAnchored; // false: distanceError is integrated velocity error
+    timeUs_t timeUs;
+    vector2_t distanceErrorCm;
+    vector2_t targetVelocityCmS;
+    vector2_t velocityCmS;
+} positionControlTelemetry_t;
+
+bool autopilotGetAltitudeTelemetry(altitudeControlTelemetry_t *sample);
+bool autopilotGetPositionTelemetry(positionControlTelemetry_t *sample);
 
 extern float autopilotAngle[RP_AXIS_COUNT]; // NOTE: ANGLES ARE IN CENTIDEGREES
 

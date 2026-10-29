@@ -75,6 +75,9 @@
 #define CRASHFLIP_STICK_DEADBAND         0.15f // 15%
 
 static FAST_DATA_ZERO_INIT float motorMixRange;
+static uint16_t finalThrottlePwm;
+static timeUs_t finalThrottleTimeUs;
+static bool finalThrottleValid;
 
 float FAST_DATA_ZERO_INIT motor[MAX_SUPPORTED_MOTORS];
 float motor_disarmed[MAX_SUPPORTED_MOTORS];
@@ -103,6 +106,9 @@ static void writeAllMotors(int16_t mc)
 void stopMotors(void)
 {
     writeAllMotors(mixerRuntime.disarmMotorOutput);
+    finalThrottlePwm = PWM_RANGE_MIN;
+    finalThrottleTimeUs = micros();
+    finalThrottleValid = true;
     delay(50); // give the timers and ESCs a chance to react.
 }
 
@@ -677,6 +683,7 @@ static void applyMixerAdjustment(float *motorMix, const float motorMixMin, const
 // [修改] 功能：计算电机混控输出，并在自主翻转时强制启用空模式补偿。
 FAST_CODE_NOINLINE void mixTable(timeUs_t currentTimeUs)
 {
+    finalThrottleValid = false;
     const bool launchControlActive = isLaunchControlActive();
     const bool airmodeEnabled = isAirmodeEnabled() || launchControlActive || autonomousModeIsFlipActive();
 
@@ -840,10 +847,17 @@ FAST_CODE_NOINLINE void mixTable(timeUs_t currentTimeUs)
         && !FLIGHT_MODE(GPS_RESCUE_MODE | ALT_HOLD_MODE | POS_HOLD_MODE)   // disable motor_stop while GPS Rescue / Alt Hold / Pos Hold is active
         && (rcData[THROTTLE] < rxConfig()->mincheck)) {
         applyMotorStop();
+        finalThrottlePwm = PWM_RANGE_MIN;
+        finalThrottleValid = true;
     } else {
         // Apply the mix to motor endpoints
         applyMixToMotors(motorMix, activeMixer);
+        finalThrottleValid = !ARMING_FLAG(ARMED) || isfinite(throttle);
+        finalThrottlePwm = ARMING_FLAG(ARMED) && finalThrottleValid
+            ? lrintf(PWM_RANGE_MIN + PWM_RANGE * constrainf(throttle, 0.0f, 1.0f))
+            : PWM_RANGE_MIN;
     }
+    finalThrottleTimeUs = currentTimeUs;
 }
 
 void mixerSetThrottleAngleCorrection(int correctionValue)
@@ -854,6 +868,16 @@ void mixerSetThrottleAngleCorrection(int correctionValue)
 float mixerGetThrottle(void)
 {
     return mixerThrottle;
+}
+
+bool mixerGetFinalThrottle(uint16_t *pwm, timeUs_t *sampleTimeUs)
+{
+    *pwm = finalThrottlePwm;
+    *sampleTimeUs = finalThrottleTimeUs;
+    const timeDelta_t ageUs = cmpTimeUs(micros(), finalThrottleTimeUs);
+    // Turtle/3D do not have the ordinary unidirectional collective semantics.
+    return finalThrottleValid && !mixerRuntime.feature3dEnabled
+        && ageUs >= 0 && ageUs < 100000;
 }
 
 float mixerGetRcThrottle(void)

@@ -154,6 +154,9 @@
 #include "fc/rc_controls.h"
 #include "fc/runtime_config.h"
 
+#include "flight/alt_hold.h"
+#include "flight/autonomous_mode.h"
+#include "flight/autopilot.h"
 #include "flight/flight_plan_nav.h"
 #include "flight/gps_rescue.h"
 #include "flight/position.h"
@@ -161,6 +164,7 @@
 #include "flight/mixer.h"
 #include "flight/pid.h"
 #include "flight/pos_hold.h"
+#include "flight/position_estimator.h"
 
 #include "io/gps.h"
 #include "io/vtx.h"
@@ -183,6 +187,7 @@
 #include "rx/rx.h"
 
 #include "sensors/adcinternal.h"
+#include "sensors/acceleration.h"
 #include "sensors/barometer.h"
 #include "sensors/battery.h"
 #include "sensors/sensors.h"
@@ -1040,6 +1045,138 @@ static void osdElementDebug(osdElementParms_t *element)
 static void osdElementDebug2(osdElementParms_t *element)
 {
     tfp_sprintf(element->buff, "D2  %5d %5d %5d %5d", debug[4], debug[5], debug[6], debug[7]);
+}
+
+static void osdElementAutonomousStatus(osdElementParms_t *element)
+{
+    static uint8_t row;
+
+#ifdef UNIT_TEST
+    // The OSD unit-test target does not link the autonomous flight module.
+    if (row == 0) {
+        tfp_sprintf(element->buff, "S0 U0 U0 U0 A0");
+    } else {
+        tfp_sprintf(element->buff, "A0 H0 P0 T----");
+    }
+#else
+    if (row == 0) {
+        tfp_sprintf(element->buff, "S%d U%d U%d U%d A%d",
+            autonomousModeGetState(),
+            autonomousModeOwnsArming(),
+            IS_RC_MODE_ACTIVE(BOXUSER2),
+            IS_RC_MODE_ACTIVE(BOXUSER3),
+            ARMING_FLAG(ARMED));
+    } else {
+        // Confirm controller engagement, not just the requested flight mode.
+        bool altitudeHoldActive = false;
+        bool positionHoldActive = false;
+#ifdef USE_ALTITUDE_HOLD
+        altitudeHoldActive = FLIGHT_MODE(ALT_HOLD_MODE) && isAltHoldActive();
+#endif
+#ifdef USE_POSITION_HOLD
+        positionHoldActive = FLIGHT_MODE(POS_HOLD_MODE) && isAutopilotInControl();
+#endif
+        uint16_t finalThrottlePwm;
+        timeUs_t throttleTimeUs;
+        if (mixerGetFinalThrottle(&finalThrottlePwm, &throttleTimeUs)) {
+            tfp_sprintf(element->buff, "A%d H%d P%d T%4d",
+                FLIGHT_MODE(ANGLE_MODE) != 0, altitudeHoldActive, positionHoldActive, finalThrottlePwm);
+        } else {
+            tfp_sprintf(element->buff, "A%d H%d P%d T----",
+                FLIGHT_MODE(ANGLE_MODE) != 0, altitudeHoldActive, positionHoldActive);
+        }
+    }
+#endif
+
+    element->elemOffsetY = row;
+    if (++row == 2) {
+        row = 0;
+    } else {
+        element->rendered = false;
+    }
+}
+
+static void osdElementAutonomousValidity(osdElementParms_t *element)
+{
+#ifdef UNIT_TEST
+    tfp_sprintf(element->buff, "Z0 XY0 ACC0 RX0");
+#else
+    const bool accValid =
+#ifdef USE_ACC
+        sensors(SENSOR_ACC) && acc.isAccelDataValid;
+#else
+        false;
+#endif
+
+    tfp_sprintf(element->buff, "Z%d XY%d ACC%d RX%d",
+        positionEstimatorIsValidZ(),
+        positionEstimatorIsValidXY(),
+        accValid,
+        isRxReceivingSignal() && rxAreFlightChannelsValid());
+#endif
+}
+
+#if !defined(UNIT_TEST) && !defined(USE_WING) && (defined(USE_ALTITUDE_HOLD) || defined(USE_POSITION_HOLD))
+static void osdFormatAutonomousTenths(char *buff, const float valueCm, const int32_t limitTenths)
+{
+    const int32_t valueTenths = constrain(lrintf(valueCm / 10.0f), -limitTenths, limitTenths);
+    const int32_t magnitude = abs(valueTenths);
+    tfp_sprintf(buff, "%s%d.%d", valueTenths < 0 ? "-" : "", magnitude / 10, magnitude % 10);
+}
+#endif
+
+static void osdElementAutonomousMotion(osdElementParms_t *element)
+{
+    static uint8_t row;
+    // m and m/s, Up positive. Three rows keep target/current height and speed
+    // separate without hiding the horizontal error or clipping an HD OSD row.
+    if (row == 0) {
+        tfp_sprintf(element->buff, "TH     -- H     --");
+    } else if (row == 1) {
+        tfp_sprintf(element->buff, "TVV    -- VV    --");
+    } else {
+        tfp_sprintf(element->buff, "HE     -- THV    -- HV    --");
+    }
+#if !defined(UNIT_TEST) && !defined(USE_WING)
+#ifdef USE_ALTITUDE_HOLD
+    if (row < 2 && FLIGHT_MODE(ALT_HOLD_MODE) && isAltHoldActive() && isAltitudeAvailable()) {
+        altitudeControlTelemetry_t sample;
+        if (autopilotGetAltitudeTelemetry(&sample)) {
+            char target[8];
+            char actual[8];
+            if (row == 0) {
+                osdFormatAutonomousTenths(target, sample.targetAltitudeCm, 10000);
+                osdFormatAutonomousTenths(actual, sample.altitudeCm, 10000);
+                tfp_sprintf(element->buff, "TH%7s H%7s", target, actual);
+            } else {
+                osdFormatAutonomousTenths(target, sample.targetVelocityCmS, 1000);
+                osdFormatAutonomousTenths(actual, sample.velocityCmS, 1000);
+                tfp_sprintf(element->buff, "TVV%6s VV%6s", target, actual);
+            }
+        }
+    }
+#endif
+#ifdef USE_POSITION_HOLD
+    if (row == 2 && FLIGHT_MODE(POS_HOLD_MODE) && isAutopilotInControl() && positionEstimatorIsValidXY()) {
+        positionControlTelemetry_t sample;
+        if (autopilotGetPositionTelemetry(&sample)) {
+            char error[8];
+            char targetSpeed[7];
+            char speed[7];
+            osdFormatAutonomousTenths(error, vector2Norm(&sample.distanceErrorCm), 10000);
+            osdFormatAutonomousTenths(targetSpeed, vector2Norm(&sample.targetVelocityCmS), 1000);
+            osdFormatAutonomousTenths(speed, vector2Norm(&sample.velocityCmS), 1000);
+            tfp_sprintf(element->buff, "HE%7s THV%6s HV%6s", error, targetSpeed, speed);
+        }
+    }
+#endif
+#endif
+    element->elemOffsetY = row;
+    if (++row == 3) {
+        row = 0;
+    } else {
+        element->rendered = false;
+    }
 }
 
 static void osdElementDisarmed(osdElementParms_t *element)
@@ -2066,6 +2203,9 @@ static const uint8_t osdElementDisplayOrder[] = {
     OSD_AVG_CELL_VOLTAGE,
     OSD_DEBUG,
     OSD_DEBUG2,
+    OSD_AUTONOMOUS_STATUS,
+    OSD_AUTONOMOUS_VALIDITY,
+    OSD_AUTONOMOUS_MOTION,
     OSD_PITCH_ANGLE,
     OSD_ROLL_ANGLE,
     OSD_MAIN_BATT_USAGE,
@@ -2210,6 +2350,9 @@ const osdElementDrawFn osdElementDrawFunction[OSD_ITEM_COUNT] = {
 #endif
     [OSD_DEBUG]                   = osdElementDebug,
     [OSD_DEBUG2]                  = osdElementDebug2,
+    [OSD_AUTONOMOUS_STATUS]       = osdElementAutonomousStatus,
+    [OSD_AUTONOMOUS_VALIDITY]     = osdElementAutonomousValidity,
+    [OSD_AUTONOMOUS_MOTION]       = osdElementAutonomousMotion,
 #ifdef USE_ACC
     [OSD_PITCH_ANGLE]             = osdElementAngleRollPitch,
     [OSD_ROLL_ANGLE]              = osdElementAngleRollPitch,

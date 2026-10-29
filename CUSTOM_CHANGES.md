@@ -1,6 +1,8 @@
 # Betaflight 自主飞行代码说明
 
-本文说明当前自主飞行实现的代码位置和功能。行号以当前工作区代码为准。
+本文说明 simplify 简化版的自主飞行实现，阶段定义更新于 2026-10-26。旧记录中的 FLIP/BRAKING/READY 编号不适用于本版；其他集成点行号仅作定位参考。
+
+2026-10-27 的 OSD/黑匣子控制器数据来源、字段单位和有效性定义见 [AUTONOMOUS_TELEMETRY.md](AUTONOMOUS_TELEMETRY.md)。
 
 代码来源标识：
 
@@ -42,10 +44,10 @@
 
 ## 功能概览
 
-自主流程使用 ARM、USER1、USER2 和 USER3 四类开关输入：
+自主流程使用 ARM、USER1、USER2、USER3 和 USER4 开关输入：
 
 - ARM 是飞手允许自主解锁的许可，同时也是 USER3 投掷流程的触发边沿输入。
-- USER2 上升沿作为一次性触发，要求 ARM 已打开且 USER1 能读到有效位置；触发后请求 synthetic failsafe 接收链路锁定。failsafe 完成处置、飞机解除 ARM 并恢复有效 RX 后，再等待代码头部定义的 1 秒延时，进入自主解锁和自由落体检测。当前 USER2 高电平可以继续完成本次流程；下一次触发前必须重新检测到低电平。
+- USER2 上升沿作为一次性触发，要求 ARM 已打开且 USER1 能读到有效位置；触发后请求 synthetic failsafe 接收链路锁定。failsafe 完成处置、飞机解除 ARM 并恢复有效 RX 后，再等待代码头部定义的 200 ms 延时，进入自主解锁和自由落体检测。当前 USER2 高电平可以继续完成本次流程；下一次触发前必须重新检测到低电平。
 - USER3 是投掷机专用的备用触发路径：USER2 为低、USER3 为高且 ARM 出现上升沿时触发自主流程，同样要求 USER1 初始位置有效。USER3 触发边沿后释放 synthetic RX 锁，等待自由落体；USER3 高电平期间禁止普通 ARM 解锁。
 - USER1 用于读取三段拨杆初始位置并检测位置变化。自主流程开始时记录初始位置，运行期间位置持续变化 30 ms 会中止自主流程。
 
@@ -56,48 +58,39 @@ USER1 需要在地面站的 Modes 页面配置，以便固件从 `modeActivation
 - 大于等于 1800：`AUTONOMOUS_USER1_POSITION_HIGH`
 - 1701 至 1799：`AUTONOMOUS_USER1_POSITION_INVALID`
 
-三个 USER1 位置不会直接启用 `ALT_HOLD_MODE` 或 `POS_HOLD_MODE`。自主状态机进入 `AUTONOMOUS_MODE_READY` 后，高度保持和最终位置保持由状态机自身请求，与 USER1 当前档位无关。
+三个 USER1 位置不会直接启用保持模式。USER4 只在阶段 5 的新上升沿申请 AUTOPILOT；提前打开并保持不会排队，也不再绕过自由落体自主解锁条件。
 
-自主状态按以下顺序流转：
+## 自主状态机（当前简化版）
 
-```text
-IDLE
-  -> WAITING_FOR_ARM
-  -> ACCEL_WAITING
-  -> FLIP（机体倒置时）
-  -> HOVER_ENTRY
-  -> BRAKING
-  -> READY
-```
+| state | 枚举 | 行为及进入下一阶段的条件 |
+| ---: | --- | --- |
+| 0 | IDLE | 等待原有 USER2 或 USER3+ARM 触发 |
+| 1 | WAITING_FOR_ARM | 原有 failsafe/RX 恢复；恢复后等待 200 ms |
+| 2 | ACCEL_WAITING | 加速度小于 0.80 G 持续 30 ms，再尝试自主解锁；成功后进入 3 |
+| 3 | REQUESTING_HOLD | 只申请 ANGLE、ALTHOLD；两个内部模式标志与定高控制器生效，且 roll、pitch 绝对值都严格小于 20°，连续保持 0.5 s 后进入 4 |
+| 4 | REQUESTING_POSITION_HOLD | 维持 ANGLE、ALTHOLD，再申请 POSHOLD；三个内部模式标志与定高、定点控制器全部生效后进入 5 |
+| 5 | HOLD | 三模式确认后保持等待，不自动推进；USER4 新上升沿且 RX/保持控制有效后进入 6 |
+| 6 | REQUESTING_AUTOPILOT | USER4 已开启，维持三模式保持并提交 AUTOPILOT 请求；模式处理接收后进入 7 |
+| 7 | WAITING_FOR_AUTOPILOT | 请求已提交，继续保持并等待内部 AUTOPILOT_MODE 标志置位；确认后进入 8 |
+| 8 | AUTOPILOT | 航线接管；释放自主姿态输入及油门覆盖，保持模式由 AUTOPILOT 驱动 |
 
-机体未倒置时，`ACCEL_WAITING` 可直接进入 `HOVER_ENTRY`。`HOVER_ENTRY` 使用文件头部定义的入口油门比例；当姿态、角速度和 Z 高度估计连续稳定后进入 `BRAKING`。`BRAKING` 从实测位置和速度启动 jerk/加速度受限的竖直、水平减速轨迹，高度闭环在此阶段接管油门；XY 估计无效时只执行定高减速。速度、加速度和姿态稳定约 250 ms 后进入 `READY`，锁定最终高度，XY 有效时锁定最终位置并申请最终 `POS_HOLD`。自主翻转最多持续 1 秒，结束阈值和油门闭环参数均在 `autonomous_mode.c` 文件头部定义。
+状态编号显式写在 `src/main/flight/autonomous_mode.h`；黑盒 `autonomousState` 和 `DEBUG_FAILSAFE[4]` 使用这些编号。**本版 state3 确认 ANGLE/ALTHOLD，state4 再确认 POSHOLD，state5 等待 USER4，state6 提交 AUTOPILOT 请求，state7 等待内部标志确认，state8 才表示 AUTOPILOT 已启用。**
 
-## 自主状态机
+阶段 3 要求 ANGLE/ALTHOLD 已生效，且横滚、俯仰绝对值都严格小于 20°，连续保持 0.5 秒后，下一阶段才申请 POSHOLD。任一轴达到或超过 20°，或者模式/定高控制器失效，都清除本次计时；中止流程或回退到阶段 3 后也需要重新确认完整的 0.5 秒。主动翻转、自定义 XY/Z 刹车、旧 READY、姿态重入分支通过 `#if 0` 暂时停用，源码保留；翻转、刹车、定制目标兼容接口返回 false/零，使用标准 ALTHOLD/POSHOLD 控制器。阶段 2 至 7 保持自主输入屏蔽和悬停油门基准。
 
-### [自定义新增] `src/main/flight/autonomous_mode.h`
+临时关闭阶段 3 的姿态和计时判定：将 `src/main/flight/autonomous_mode.c` 头部的 `AUTONOMOUS_STATE3_LEVEL_CHECK_ENABLED` 从 `1` 改成 `0`，重新编译并刷写固件。关闭后仍确认 ANGLE/ALTHOLD 及定高控制器已生效，然后直接进入阶段 4；恢复为 `1` 即重新启用双轴小于 20° 连续 0.5 秒的条件。
 
-- 第 8-13 行：`autonomousUser1Position_e`，定义 USER1 的低、中、高和无效位置。
-- 第 15-23 行：`autonomousModeState_e`，定义空闲、等待 ARM、自由落体检测、翻转、悬停入口、自主减速和 READY 状态。
-- 第 25-50 行：声明自主流程更新、解锁接管、油门覆盖、翻转输出、控制模式请求、状态读取和中止接口。
-- 第 48-50 行：USER1 高度/位置保持兼容接口固定返回 `false`。
+阶段 4 若 ANGLE/ALTHOLD 或定高控制器失效，回到 3；仅 POSHOLD 未生效时留在 4 等待。阶段 5/6/7 若三个模式或保持控制器失效，回到 3 重新确认。阶段 6/7 关闭 USER4 回到 5（保持失效则回 3）。阶段 8 关闭 USER4 或丢失 AUTOPILOT_MODE 回到 3，再经 4 确认后进入 5；再次申请航线需要 USER4 新上升沿。ARM 关闭、USER1 变化持续 30 ms、failsafe 的原有退出处理保留。
 
-### [自定义新增] `src/main/flight/autonomous_mode.c`
+`src/main/fc/core.c` 接收自主 AUTOPILOT 请求时回调，使 6→7；实际启用 AUTOPILOT_MODE 后再回调，使 7→8。提交请求不会直接记为 8，阶段 5 也不会自动变为 6。自主流程中原始 BOXAUTOPILOT 不得提前接管；failsafe/rescue 逻辑保留优先级。
 
-- 第 25-50 行：自由落体、悬停、USER1 防抖、USER2 延时、翻转闭环和自主减速轨迹参数。
-- 第 81 行：`autonomousModeResetFreefallDetection()`，复位自由落体候选检测。
-- 第 89 行：`autonomousModeResetHoverStability()`，复位悬停稳定候选检测。
-- 第 97 行：`autonomousModeReadUser1Position()`，通过 BOXUSER1 配置取得 AUX 通道并读取原始拨杆位置。
-- 第 122 行：`autonomousModeResetToIdle()`，复位自主状态机、检测状态、翻转输出和 USER1 位置状态；触发开关仍为高电平时保留对应锁定。
-- 第 143 行：`autonomousModeStartAccelerationDetection()`，进入自由落体检测阶段。
-- 第 162 行：`autonomousModeAbort()`，中止当前流程并回到空闲状态。
-- 第 168-198 行：提供自主解锁接管、飞手输入屏蔽、油门覆盖和自主油门 PWM 输出。
-- 第 202-220 行：提供自主翻转状态、角速度和油门输出。
-- 第 224-330 行：提供 ANGLE、高度保持、位置保持、飞手保持模式屏蔽请求和自主减速轨迹目标接口。
-- 第 253-274 行：读取自主状态和 USER1 位置；USER1 高度/位置保持兼容接口固定返回 `false`。
-- 第 350 行：`autonomousModeUpdate()`，处理 USER2/USER3/ARM 边沿、failsafe 恢复、USER1 位置变化、自由落体检测、自动解锁、翻转、入口调平、BRAKING 轨迹和最终保持状态流转；SITL 下每秒输出姿态和加速度诊断。
-- 第 545 行：`autonomousModeResetFlip()`，复位翻转轴、方向、角速度和油门控制量。
-- 第 557 行：`autonomousModeStartFlip()`，根据重力投影选择翻转轴和方向，并复位 PID 积分。
-- 第 587 行：`autonomousModeUpdateFlipControl()`，根据倾角和实际角速度闭环更新翻转角速度及油门，并限制油门变化速率。
+自主解锁专用检查允许屏蔽 ANGLE、THROTTLE、ARM_SWITCH、ALTHOLD、POSHOLD、AUTOPILOT 禁止标志，普通解锁检查不变。`throttleRaised` 在自主解锁后置位，后续航线模式仍须满足 ACC、GPS/FIX、高度可用等条件。
+
+测试入口：
+
+- 离线状态机回归：`make -C src/test test_autonomous_mode_unittest`
+- SITL 集成：`python3 src/test/sitl/autonomous_user4.py --binary obj/main/betaflight_SITL.elf`
+- 飞控构建：`make -j4 CONFIG=GEPRCF722_BT_HD_V3`
 
 ## 飞控集成点
 
@@ -108,7 +101,7 @@ IDLE
 
 ### [官方代码修改] 解锁与飞行模式
 
-- `src/main/fc/core.c:567`：`tryArmInternal()` 合并普通和自主解锁检查；自主解锁额外忽略 ANGLE、THROTTLE 和 ARM_SWITCH 三类阻止标志。
+- `src/main/fc/core.c:567`：`tryArmInternal()` 合并普通和自主解锁检查；自主解锁额外忽略 ANGLE、THROTTLE、ARM_SWITCH、ALTHOLD、POSHOLD、AUTOPILOT 阻止标志。
 - `src/main/fc/core.c:708`：`tryArm()` 保留普通飞手解锁入口。
 - `src/main/fc/core.c:715`：`tryArmAutonomous()` 提供自主解锁入口并返回结果。
 - `src/main/fc/core.h:80`：声明 `tryArmAutonomous()`。
@@ -136,7 +129,7 @@ IDLE
 - `src/main/flight/failsafe.c:632`：在 `DEBUG_FAILSAFE` 中输出自主锁定状态和解锁阻止标志。
 - `src/main/flight/failsafe.h:110`：声明自主锁定查询和请求接口。
 
-### [官方代码修改] 翻转保护
+### [官方代码修改] 历史翻转保护接口（当前简化版不触发）
 
 - `src/main/flight/mixer.c:678`：`mixTable()` 在自主翻转期间强制启用空中模式补偿。
 - `src/main/flight/pid.c:651`：`handleCrashRecovery()` 在自主翻转期间跳过失控恢复干预。

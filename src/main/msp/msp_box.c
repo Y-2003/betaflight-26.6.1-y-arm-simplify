@@ -197,7 +197,7 @@ void serializeBoxReply(sbuf_t *dst, int page, serializeBoxFn *serializeBox)
     }
 }
 
-// [修改] 功能：初始化 MSP 可见开关，并暴露 USER1/USER2/USER3 的 AUX 通道映射入口。
+// [修改] 功能：初始化 MSP 可见开关，并暴露 USER1/USER2/USER3/USER4 的 AUX 通道映射入口。
 // USER1 的配置仅用于选择待读取的通道，不会直接启用高度或位置保持模式。
 void initActiveBoxIds(void)
 {
@@ -336,6 +336,7 @@ void initActiveBoxIds(void)
     BME(BOXUSER1);
     BME(BOXUSER2);
     BME(BOXUSER3);
+    BME(BOXUSER4);
 
 #ifdef USE_PINIOBOX
     // Turn BOXUSERx only if pinioBox facility monitors them, as the facility is the only BOXUSERx observer.

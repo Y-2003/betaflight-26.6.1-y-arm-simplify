@@ -23,6 +23,10 @@
 extern "C" {
 
     #include "platform.h"
+    #include "drivers/time.h"
+
+    static timeUs_t telemetryTimeUs;
+    timeUs_t micros(void) { return telemetryTimeUs; }
     #include "build/debug.h"
     #include "pg/pg_ids.h"
 
@@ -942,4 +946,57 @@ TEST_F(NavModeTest, PositionControlResetIsDeterministic)
         EXPECT_FLOAT_EQ(autopilotAngle[AI_ROLL], baselineRoll[i]);
         EXPECT_FLOAT_EQ(autopilotAngle[AI_PITCH], baselinePitch[i]);
     }
+}
+
+TEST_F(PosHoldTest, TelemetryUsesControlVectorsAndInvalidatesOnFailure)
+{
+    initAndSettleAt(0, 0, 0);
+    debugMode = DEBUG_NONE;
+    telemetryTimeUs = 2000000;
+    testEstimate.position.v[EF_EAST] = 10.0f;
+    testEstimate.position.v[EF_NORTH] = -20.0f;
+    testEstimate.velocity.v[EF_EAST] = 30.0f;
+    testEstimate.velocity.v[EF_NORTH] = -40.0f;
+    ASSERT_TRUE(positionControl());
+    positionControlTelemetry_t sample;
+    ASSERT_TRUE(autopilotGetPositionTelemetry(&sample));
+    EXPECT_FLOAT_EQ(sample.velocityCmS.v[EF_EAST], 30.0f);
+    EXPECT_FLOAT_EQ(sample.velocityCmS.v[EF_NORTH], -40.0f);
+    EXPECT_FLOAT_EQ(sample.targetVelocityCmS.v[EF_EAST], 0.0f);
+    EXPECT_FLOAT_EQ(sample.targetVelocityCmS.v[EF_NORTH], 0.0f);
+    EXPECT_FLOAT_EQ(sample.distanceErrorCm.v[EF_EAST], -10.0f);
+    EXPECT_FLOAT_EQ(sample.distanceErrorCm.v[EF_NORTH], 20.0f);
+    EXPECT_TRUE(sample.positionAnchored);
+
+    telemetryTimeUs += AUTOPILOT_TELEMETRY_TIMEOUT_US;
+    EXPECT_FALSE(autopilotGetPositionTelemetry(&sample));
+    ASSERT_TRUE(positionControl());
+    ASSERT_TRUE(autopilotGetPositionTelemetry(&sample));
+    testEstimate.isValidXY = false;
+    EXPECT_FALSE(positionControl());
+    EXPECT_FALSE(autopilotGetPositionTelemetry(&sample));
+}
+
+TEST_F(NavModeTest, TelemetryFollowsNavigationTargetsAndCanUseVirtualError)
+{
+    engageNav(30, 30, 0, 0, 30, 45);
+    setNavCarrot(1.0f, 2.0f);
+    mockTargetVelCmS = (vector3_t){{80.0f, -120.0f, 0.0f}};
+    telemetryTimeUs = 3000000;
+    ASSERT_TRUE(positionControl());
+    positionControlTelemetry_t sample;
+    ASSERT_TRUE(autopilotGetPositionTelemetry(&sample));
+    EXPECT_FLOAT_EQ(sample.targetVelocityCmS.v[EF_EAST], 80.0f);
+    EXPECT_FLOAT_EQ(sample.targetVelocityCmS.v[EF_NORTH], -120.0f);
+    EXPECT_FLOAT_EQ(sample.distanceErrorCm.v[EF_EAST], 100.0f);
+    EXPECT_FLOAT_EQ(sample.distanceErrorCm.v[EF_NORTH], 200.0f);
+    EXPECT_TRUE(sample.positionAnchored);
+
+    mockNavHasActiveTarget = false;
+    setSticksActiveStatus(true);
+    ASSERT_TRUE(positionControl());
+    ASSERT_TRUE(autopilotGetPositionTelemetry(&sample));
+    EXPECT_FALSE(sample.positionAnchored);
+    resetPositionControl(100);
+    EXPECT_FALSE(autopilotGetPositionTelemetry(&sample));
 }
